@@ -24,3 +24,4 @@
 long int pow_hash(long int x);
 
 #endif
+
