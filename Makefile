@@ -2,9 +2,10 @@ CC      := gcc
 CFLAGS  := -Wall -Wextra -Wpedantic -O2 -Iinclude
 LDFLAGS := -pthread
 
-SRC := src/main.c src/miner.c src/logger.c pow.c
+# Agregamos main.c
+SRC := src/main.c src/miner.c src/logger.c src/pow.c
 OBJ := $(SRC:.c=.o)
-BIN := mrush
+BIN := miner
 
 all: $(BIN)
 

@@ -1,9 +1,10 @@
 #ifndef MINER_H
 #define MINER_H
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <stdint.h>
-#include "logger.h"
-#include "pow.h"
+#include <unistd.h>
 #include "pthread.h"
 
 typedef struct {

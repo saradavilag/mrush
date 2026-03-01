@@ -1,79 +1,32 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdint.h>
-#include <unistd.h>
 #include "miner.h"
+#include "pow.h"
 
-static void usage(const char *prog) {
-    fprintf(stderr, "Usage: %s <TARGET_INI> <ROUNDS> <N_THREADS>\n", prog);
-}
+void *worker(void *arg)
+{
+    worker_args_t *args = (worker_args_t *)arg;
 
-static void print_child_status(const char *name, int status) {
-    if (WIFEXITED(status)) {
-        printf("%s exited with status %d\n", name, WEXITSTATUS(status));
-    } else {
-        printf("%s exited unexpectedly\n", name);
-    }
-}
+    for (uint32_t i = args->start; i < args->end; i++) {
 
+        /* Si otro hilo ya encontró solución, salir */
+        if (*(args->found))
+            break;
 
-int main(int argc, char *argv[]) {
-    
-    /* Comprobamos numero de argumentos */
-    if (argc != 4) { 
-        usage(argv[0]); 
-        return EXIT_FAILURE; 
-    }
+        if (pow_hash(i) == args->target) {
 
-    /* Guardamos los argumentos */
-    uint32_t target_ini = (uint32_t)strtoul(argv[1], NULL, 10);
-    int rounds = (int)strtol(argv[2], NULL, 10);
-    int n_threads = (int)strtol(argv[3], NULL, 10);
-    if (rounds <= 0 || n_threads <= 0) {
-        fprintf(stderr, "ROUNDS and N_THREADS must be > 0\n");
-        return EXIT_FAILURE;
+            /* Funcion para asegurar el buen funcionamiento concurrente de los hilos */
+            pthread_mutex_lock(args->mutex);
+
+            if (!*(args->found)) {
+                *(args->solution) = i;
+                *(args->found) = 1;
+            }
+
+            pthread_mutex_unlock(args->mutex);
+            break;
+        }
     }
 
-    /* Creamos las tuberias */
-    int fd[2];
-
-    if (pipe(fd) == -1) { 
-        perror("pipe"); 
-        return EXIT_FAILURE; 
-    }
-
-    /* Creamos nuevo proceso */
-    pid_t pid = fork();
-    if (pid < 0) { 
-        perror("fork"); 
-        return EXIT_FAILURE; 
-    }
-
-    /* Proceso hijo, REGISTRADOR */
-    if (pid == 0) {
-        // LOGGER (hijo) - por ahora trivial
-        close(fd[1]); // no escribe
-        // En pasos siguientes: return logger_run(fd[0]);
-        printf("Logger starting (trivial)\n");
-        close(fd[0]);
-        exit(EXIT_SUCCESS);
-    }
-
-    /* Proceso padre, MINERO */
-    close(fd[0]); // no lee
-    if (miner_run(fd[1], target_ini, rounds, n_threads) == EXIT_FAILURE){
-        return EXIT_FAILURE;
-    }
-    printf("Miner starting (trivial)\n");
-    close(fd[1]); // importante: cerrar para que el logger vea EOF en versión real
-
-    int st;
-    waitpid(pid, &st, 0);
-    print_child_status("Logger", st);
-
-    // Mensaje propio
-    printf("Miner exited with status %d\n", 0);
-    return EXIT_SUCCESS;
+    return NULL;
 }
 
 int miner_run(int write_fd, uint32_t target_ini, int rounds, int n_threads)
@@ -141,29 +94,3 @@ int miner_run(int write_fd, uint32_t target_ini, int rounds, int n_threads)
     return EXIT_SUCCESS;
 }
 
-void *worker(void *arg)
-{
-    worker_args_t *args = (worker_args_t *)arg;
-
-    for (uint32_t i = args->start; i < args->end; i++) {
-
-        /* Si otro hilo ya encontró solución, salir */
-        if (*(args->found))
-            break;
-
-        if (pow_hash(i) == args->target) {
-
-            pthread_mutex_lock(args->mutex);
-
-            if (!*(args->found)) {
-                *(args->solution) = i;
-                *(args->found) = 1;
-            }
-
-            pthread_mutex_unlock(args->mutex);
-            break;
-        }
-    }
-
-    return NULL;
-}
