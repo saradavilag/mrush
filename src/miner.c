@@ -1,24 +1,36 @@
 #include "miner.h"
-#include "pow.h"
 
 void *worker(void *arg)
 {
-    worker_args_t *args = (worker_args_t *)arg;
+    worker_args *args = (worker_args *)arg;
 
     for (uint32_t i = args->start; i < args->end; i++) {
 
-        /* Si otro hilo ya encontró solución, salir */
-        if (*(args->found))
+        pthread_mutex_lock(args->mutex);
+        int already_found = *(args->found);
+        pthread_mutex_unlock(args->mutex);
+
+        if (already_found)
             break;
 
         if (pow_hash(i) == args->target) {
 
-            /* Funcion para asegurar el buen funcionamiento concurrente de los hilos */
             pthread_mutex_lock(args->mutex);
 
             if (!*(args->found)) {
+
                 *(args->solution) = i;
                 *(args->found) = 1;
+
+                log_args msg;
+                msg.round = args->round;
+                msg.target = args->target;
+                msg.solution = i;
+                msg.valid = 1;
+
+                if(write(args->write_fd, &msg, sizeof(msg)) != sizeof(msg)){
+                    perror("write pipe");
+                }
             }
 
             pthread_mutex_unlock(args->mutex);
@@ -29,12 +41,10 @@ void *worker(void *arg)
     return NULL;
 }
 
-int miner_run(int write_fd, uint32_t target_ini, int rounds, int n_threads)
-{
-    (void)write_fd;   // aún no usado (parte c)
-
+int miner_run(int write_fd, int read_fd, uint32_t target_ini, int rounds, int n_threads)
+{ 
     pthread_t threads[n_threads];
-    worker_args_t args[n_threads];
+    worker_args args[n_threads];
 
     pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -62,6 +72,8 @@ int miner_run(int write_fd, uint32_t target_ini, int rounds, int n_threads)
             args[i].solution = &solution;
             args[i].found = &found;
             args[i].mutex = &mutex;
+            args[i].round = r;
+            args[i].write_fd = write_fd;
 
             int ret = pthread_create(&threads[i], NULL, worker, &args[i]);
             if (ret != 0) {
@@ -83,6 +95,13 @@ int miner_run(int write_fd, uint32_t target_ini, int rounds, int n_threads)
         /* imprimir resultado de la ronda */
         printf("Solution accepted : %08u --> %08u\n",
                target, solution);
+        
+        /* Leemos la respuesta del logger */
+        int ack;
+        if (read(read_fd, &ack, sizeof(ack)) <= 0) {
+            perror("read ack");
+            return EXIT_FAILURE;
+        }
 
         /* siguiente ronda usa la solución como target */
         target = solution;
@@ -90,7 +109,6 @@ int miner_run(int write_fd, uint32_t target_ini, int rounds, int n_threads)
 
     pthread_mutex_destroy(&mutex);
 
-    printf("Miner finished correctly\n");
     return EXIT_SUCCESS;
 }
 

@@ -1,74 +1,70 @@
 #include <stdio.h>
+#include <sys/wait.h>
 #include "miner.h"
-#include "logger.h"
-#include "pow.h"
-
-static void usage(const char *prog) {
-    fprintf(stderr, "Usage: %s <TARGET_INI> <ROUNDS> <N_THREADS>\n", prog);
-}
-
-static void print_child_status(const char *name, int status) {
-    if (WIFEXITED(status)) {
-        printf("%s exited with status %d\n", name, WEXITSTATUS(status));
-    } else {
-        printf("%s exited unexpectedly\n", name);
-    }
-}
 
 int main(int argc, char *argv[]) {
-    
-    /* Comprobamos numero de argumentos */
-    if (argc != 4) { 
-        usage(argv[0]); 
-        return EXIT_FAILURE; 
+
+    if (argc != 4) {
+        fprintf(stderr,"Usage: ./miner <TARGET_INI> <ROUNDS> <N_THREADS>\n");
+        return EXIT_FAILURE;
     }
 
-    /* Guardamos los argumentos */
     uint32_t target_ini = (uint32_t)strtoul(argv[1], NULL, 10);
     int rounds = (int)strtol(argv[2], NULL, 10);
     int n_threads = (int)strtol(argv[3], NULL, 10);
-    if (rounds <= 0 || n_threads <= 0) {
-        fprintf(stderr, "ROUNDS and N_THREADS must be > 0\n");
+
+    int m2l[2]; // miner -> logger
+    int l2m[2]; // logger -> miner
+
+    if (pipe(m2l) == -1) {
+        perror("pipe m2l");
         return EXIT_FAILURE;
     }
 
-    /* Creamos las tuberias */
-    int fd[2];
-
-    if (pipe(fd) == -1) { 
-        perror("pipe"); 
-        return EXIT_FAILURE; 
+    if (pipe(l2m) == -1) {
+        perror("pipe l2m");
+        return EXIT_FAILURE;
     }
 
-    /* Creamos nuevo proceso */
     pid_t pid = fork();
-    if (pid < 0) { 
-        perror("fork"); 
-        return EXIT_FAILURE; 
+    if (pid < 0) {
+        perror("fork");
+        return EXIT_FAILURE;
     }
 
-    /* Proceso hijo, REGISTRADOR */
+    /* ================= LOGGER ================= */
     if (pid == 0) {
-        // Hijo = Registrador
-        close(fd[1]); // no escribe
-        int status = logger_run(fd[0], fd[1]);
-        close(fd[0]);
+
+        close(m2l[1]); // no escribe hacia logger
+        close(l2m[0]); // no lee ACK
+
+        int status = logger_run(m2l[0], l2m[1]);
+
+        close(m2l[0]);
+        close(l2m[1]);
+
         exit(status);
     }
 
-    /* Proceso padre, MINERO */
-    close(fd[0]); // no lee
-    if (miner_run(fd[1], target_ini, rounds, n_threads) == EXIT_FAILURE){
+    /* ================= MINER ================= */
+    close(m2l[0]); // no lee
+    close(l2m[1]); // no escribe ACK
+
+    if (miner_run(m2l[1], l2m[0],
+                  target_ini, rounds, n_threads) == EXIT_FAILURE)
         return EXIT_FAILURE;
-    }
-    printf("Miner starting (trivial)\n");
-    close(fd[1]); // importante: cerrar para que el logger vea EOF en versión real
+
+    close(m2l[1]);
+    close(l2m[0]);
 
     int st;
     waitpid(pid, &st, 0);
-    print_child_status("Logger", st);
 
-    // Mensaje propio
-    printf("Miner exited with status %d\n", 0);
+    if (WIFEXITED(st))
+        printf("Logger exited with status %d\n", WEXITSTATUS(st));
+    else
+        printf("Logger exited unexpectedly\n");
+
+    printf("Miner exited with status 0\n");
     return EXIT_SUCCESS;
 }
