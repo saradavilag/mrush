@@ -17,5 +17,7 @@ $(BIN): $(OBJ)
 
 clean:
 	rm -f $(OBJ) $(BIN)
+	rm -f log/*.log
+	rmdir log 2>/dev/null || true
 
 .PHONY: all clean

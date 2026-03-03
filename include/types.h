@@ -1,3 +1,6 @@
+#ifndef TYPES_H
+#define TYPES_H
+
 #include <stdio.h>
 #include <stdint.h>
 #include <pthread.h>
@@ -24,3 +27,4 @@ typedef struct _worker_args{
     int write_fd;
 } worker_args;
 
+#endif
