@@ -2,8 +2,7 @@ CC      := gcc
 CFLAGS  := -Wall -Wextra -Wpedantic -O2 -Iinclude
 LDFLAGS := -pthread
 
-# Agregamos main.c
-SRC := src/main.c src/miner.c src/logger.c src/pow.c
+SRC := src/main.c src/managers.c src/pow.c
 OBJ := $(SRC:.c=.o)
 BIN := miner
 
@@ -17,7 +16,6 @@ $(BIN): $(OBJ)
 
 clean:
 	rm -f $(OBJ) $(BIN)
-	rm -f log/*.log
-	rmdir log 2>/dev/null || true
+	rm -f /tmp/mrush_miners.txt /tmp/mrush_target.txt /tmp/mrush_votes.txt
 
 .PHONY: all clean
