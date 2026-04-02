@@ -2,7 +2,6 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -77,7 +76,8 @@ static int pid_in_list(const pid_t pids[], size_t count, pid_t pid) {
     return 0;
 }
 
-int managers_open_all(sem_t **miners_sem, sem_t **target_sem) {
+int managers_open_all(sem_t **miners_sem, sem_t **target_sem,
+                      sem_t **votes_sem, sem_t **winner_sem) {
     *miners_sem = sem_open(MINERS_SEM_NAME, O_CREAT, S_IRUSR | S_IWUSR, 1);
     if (*miners_sem == SEM_FAILED) {
         perror("sem_open MINERS_SEM_NAME");
@@ -91,20 +91,44 @@ int managers_open_all(sem_t **miners_sem, sem_t **target_sem) {
         return -1;
     }
 
+    *votes_sem = sem_open(VOTES_SEM_NAME, O_CREAT, S_IRUSR | S_IWUSR, 1);
+    if (*votes_sem == SEM_FAILED) {
+        perror("sem_open VOTES_SEM_NAME");
+        sem_close(*miners_sem);
+        sem_close(*target_sem);
+        return -1;
+    }
+
+    *winner_sem = sem_open(WINNER_SEM_NAME, O_CREAT, S_IRUSR | S_IWUSR, 1);
+    if (*winner_sem == SEM_FAILED) {
+        perror("sem_open WINNER_SEM_NAME");
+        sem_close(*miners_sem);
+        sem_close(*target_sem);
+        sem_close(*votes_sem);
+        return -1;
+    }
+
     return 0;
 }
 
-int managers_close_all(sem_t *miners_sem, sem_t *target_sem) {
+int managers_close_all(sem_t *miners_sem, sem_t *target_sem,
+                       sem_t *votes_sem, sem_t *winner_sem) {
     if (miners_sem != NULL && sem_close(miners_sem) == -1) {
         perror("sem_close miners_sem");
         return -1;
     }
-
     if (target_sem != NULL && sem_close(target_sem) == -1) {
         perror("sem_close target_sem");
         return -1;
     }
-
+    if (votes_sem != NULL && sem_close(votes_sem) == -1) {
+        perror("sem_close votes_sem");
+        return -1;
+    }
+    if (winner_sem != NULL && sem_close(winner_sem) == -1) {
+        perror("sem_close winner_sem");
+        return -1;
+    }
     return 0;
 }
 
@@ -206,17 +230,23 @@ int managers_remove_miner(sem_t *miners_sem, pid_t self) {
     }
 
     if (kept_count == 0) {
+        target_remove_if_exists(NULL);
+        votes_remove_if_exists(NULL);
+
         if (sem_unlink(MINERS_SEM_NAME) == -1 && errno != ENOENT) {
             perror("sem_unlink MINERS_SEM_NAME");
             return -1;
         }
-
-        if (target_remove_if_exists(NULL) == -1) {
-            return -1;
-        }
-
         if (sem_unlink(TARGET_SEM_NAME) == -1 && errno != ENOENT) {
             perror("sem_unlink TARGET_SEM_NAME");
+            return -1;
+        }
+        if (sem_unlink(VOTES_SEM_NAME) == -1 && errno != ENOENT) {
+            perror("sem_unlink VOTES_SEM_NAME");
+            return -1;
+        }
+        if (sem_unlink(WINNER_SEM_NAME) == -1 && errno != ENOENT) {
+            perror("sem_unlink WINNER_SEM_NAME");
             return -1;
         }
     }
@@ -245,6 +275,7 @@ int managers_read_pids(sem_t *miners_sem, pid_t pids[], size_t max_pids, size_t 
 
 int target_init_if_needed(sem_t *target_sem) {
     FILE *f;
+    round_info_t info = {1, 0, -1, 0};
 
     if (sem_wait(target_sem) == -1) {
         perror("sem_wait target_sem");
@@ -266,7 +297,8 @@ int target_init_if_needed(sem_t *target_sem) {
             return -1;
         }
 
-        if (fprintf(f, "%u\n", 0U) < 0) {
+        if (fprintf(f, "%u %u %d %u\n",
+                    info.round, info.target, (int)info.winner, info.solution) < 0) {
             perror("fprintf TARGET_FILE");
             fclose(f);
             sem_post(target_sem);
@@ -290,9 +322,10 @@ int target_init_if_needed(sem_t *target_sem) {
     return 0;
 }
 
-int target_read(sem_t *target_sem, uint32_t *target) {
+int target_read_info(sem_t *target_sem, round_info_t *info) {
     FILE *f;
-    unsigned int tmp;
+    unsigned int round, target, solution;
+    int winner;
 
     if (sem_wait(target_sem) == -1) {
         perror("sem_wait target_sem");
@@ -306,7 +339,7 @@ int target_read(sem_t *target_sem, uint32_t *target) {
         return -1;
     }
 
-    if (fscanf(f, "%u", &tmp) != 1) {
+    if (fscanf(f, "%u %u %d %u", &round, &target, &winner, &solution) != 4) {
         fprintf(stderr, "Invalid target file format\n");
         fclose(f);
         sem_post(target_sem);
@@ -314,7 +347,11 @@ int target_read(sem_t *target_sem, uint32_t *target) {
     }
 
     fclose(f);
-    *target = (uint32_t)tmp;
+
+    info->round = round;
+    info->target = target;
+    info->winner = (pid_t)winner;
+    info->solution = solution;
 
     if (sem_post(target_sem) == -1) {
         perror("sem_post target_sem");
@@ -324,7 +361,7 @@ int target_read(sem_t *target_sem, uint32_t *target) {
     return 0;
 }
 
-int target_write(sem_t *target_sem, uint32_t target) {
+int target_write_info(sem_t *target_sem, const round_info_t *info) {
     FILE *f;
 
     if (sem_wait(target_sem) == -1) {
@@ -339,7 +376,8 @@ int target_write(sem_t *target_sem, uint32_t target) {
         return -1;
     }
 
-    if (fprintf(f, "%u\n", target) < 0) {
+    if (fprintf(f, "%u %u %d %u\n",
+                info->round, info->target, (int)info->winner, info->solution) < 0) {
         perror("fprintf TARGET_FILE");
         fclose(f);
         sem_post(target_sem);
@@ -379,6 +417,144 @@ int target_remove_if_exists(sem_t *target_sem) {
 
     if (locked && sem_post(target_sem) == -1) {
         perror("sem_post target_sem");
+        return -1;
+    }
+
+    return 0;
+}
+
+int votes_reset(sem_t *votes_sem) {
+    FILE *f;
+
+    if (votes_sem != NULL && sem_wait(votes_sem) == -1) {
+        perror("sem_wait votes_sem");
+        return -1;
+    }
+
+    f = fopen(VOTES_FILE, "w");
+    if (f == NULL) {
+        perror("fopen VOTES_FILE (write)");
+        if (votes_sem != NULL) sem_post(votes_sem);
+        return -1;
+    }
+
+    if (fclose(f) != 0) {
+        perror("fclose VOTES_FILE");
+        if (votes_sem != NULL) sem_post(votes_sem);
+        return -1;
+    }
+
+    if (votes_sem != NULL && sem_post(votes_sem) == -1) {
+        perror("sem_post votes_sem");
+        return -1;
+    }
+
+    return 0;
+}
+
+int votes_add(sem_t *votes_sem, char vote) {
+    FILE *f;
+
+    if (sem_wait(votes_sem) == -1) {
+        perror("sem_wait votes_sem");
+        return -1;
+    }
+
+    f = fopen(VOTES_FILE, "a");
+    if (f == NULL) {
+        perror("fopen VOTES_FILE (append)");
+        sem_post(votes_sem);
+        return -1;
+    }
+
+    if (fprintf(f, "%c\n", vote) < 0) {
+        perror("fprintf VOTES_FILE");
+        fclose(f);
+        sem_post(votes_sem);
+        return -1;
+    }
+
+    if (fclose(f) != 0) {
+        perror("fclose VOTES_FILE");
+        sem_post(votes_sem);
+        return -1;
+    }
+
+    if (sem_post(votes_sem) == -1) {
+        perror("sem_post votes_sem");
+        return -1;
+    }
+
+    return 0;
+}
+
+int votes_read(sem_t *votes_sem, char votes[], size_t max_votes,
+               size_t *count, int *yes, int *no) {
+    FILE *f;
+    char v;
+    size_t used = 0;
+    int y = 0, n = 0;
+
+    *count = 0;
+    *yes = 0;
+    *no = 0;
+
+    if (sem_wait(votes_sem) == -1) {
+        perror("sem_wait votes_sem");
+        return -1;
+    }
+
+    f = fopen(VOTES_FILE, "r");
+    if (f == NULL) {
+        if (errno == ENOENT) {
+            sem_post(votes_sem);
+            return 0;
+        }
+        perror("fopen VOTES_FILE (read)");
+        sem_post(votes_sem);
+        return -1;
+    }
+
+    while (fscanf(f, " %c", &v) == 1) {
+        if (used < max_votes) {
+            votes[used++] = v;
+        }
+        if (v == 'Y') ++y;
+        else if (v == 'N') ++n;
+    }
+
+    fclose(f);
+
+    if (sem_post(votes_sem) == -1) {
+        perror("sem_post votes_sem");
+        return -1;
+    }
+
+    *count = used;
+    *yes = y;
+    *no = n;
+    return 0;
+}
+
+int votes_remove_if_exists(sem_t *votes_sem) {
+    int locked = 0;
+
+    if (votes_sem != NULL) {
+        if (sem_wait(votes_sem) == -1) {
+            perror("sem_wait votes_sem");
+            return -1;
+        }
+        locked = 1;
+    }
+
+    if (unlink(VOTES_FILE) == -1 && errno != ENOENT) {
+        perror("unlink VOTES_FILE");
+        if (locked) sem_post(votes_sem);
+        return -1;
+    }
+
+    if (locked && sem_post(votes_sem) == -1) {
+        perror("sem_post votes_sem");
         return -1;
     }
 
