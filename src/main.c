@@ -22,24 +22,38 @@
 #include <stdint.h>   /* uint32_t */
 #include <unistd.h>   /* pipe, fork, close */
 #include <sys/wait.h> /* waitpid, WIFEXITED, WEXITSTATUS */
+#include <semaphore.h>
 
 #include "miner.h"
+
+sem_t *mutex = NULL;
+int n_miners = 0;
+
+int init_system(){
+    if (mutex = sem_open("mutex", O_CREAT | O_EXCL, 0644, 1) == NULL){
+        return EXIT_FAILURE;
+    }
+
+}
 
 int main(int argc, char *argv[]) {
 
     /* Validación de argumentos según enunciado:
     ./miner <TARGET_INI> <ROUNDS> <N_THREADS> */
-    if (argc != 4) {
-        fprintf(stderr, "Usage: ./miner <TARGET_INI> <ROUNDS> <N_THREADS>\n");
+    if (argc != 3) {
+        fprintf(stderr, "Usage: ./miner <N_SEC> <N_THREADS>\n");
         return EXIT_FAILURE;
     }
 
     /* Parseo de parámetros:
-    - TARGET_INI es uint32_t
-    - ROUNDS y N_THREADS son enteros */
-    uint32_t target_ini = (uint32_t)strtoul(argv[1], NULL, 10);
-    int rounds = (int)strtol(argv[2], NULL, 10);
-    int n_threads = (int)strtol(argv[3], NULL, 10);
+    - N_SECS y N_THREADS son enteros */
+    int n_secs = (int)strtol(argv[1], NULL, 10);
+    int n_threads = (int)strtol(argv[2], NULL, 10);
+
+    /* Inicializamos los semaforos */
+    if (init_system() == EXIT_FAILURE){
+        return EXIT_FAILURE;
+    }
 
     /* Tuberías:
     m2l: canal Miner -> Logger (envío de log_args)
@@ -89,6 +103,14 @@ int main(int argc, char *argv[]) {
     if (miner_run(m2l[1], l2m[0], target_ini, rounds, n_threads) == EXIT_FAILURE)
         return EXIT_FAILURE;
 
+    /* Añadimos el minero al sistema */
+    sem_wait(mutex);
+    n_miners ++;
+    if (miner_add_system(FILENAME) == EXIT_FAILURE){
+        return EXIT_FAILURE;
+    }
+    sem_post(mutex);
+
     /* Señal de EOF al logger: cerrar extremo de escritura */
     close(m2l[1]);
     close(l2m[0]);
@@ -103,5 +125,23 @@ int main(int argc, char *argv[]) {
         printf("Logger exited unexpectedly\n");
 
     printf("Miner exited with status 0\n");
+
+    /* Eliminamos el minero del sistema */
+    sem_wait(mutex);
+    n_miners --;
+    if (miner_del_system(FILENAME) == EXIT_FAILURE){
+        return EXIT_FAILURE;
+    }
+    if (n_miners == 0){
+        if (miner_del_file(FILENAME) == EXIT_FAILURE){
+            return EXIT_FAILURE;
+        }
+    } 
+    sem_post(mutex);
+
     return EXIT_SUCCESS;
 }
+
+
+
+

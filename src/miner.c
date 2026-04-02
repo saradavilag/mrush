@@ -86,7 +86,7 @@ static void *worker(void *arg) {
  * @param fd Descriptor de fichero destino.
  * @param buf Buffer origen.
  * @param n Número de bytes a escribir.
- * @return 0 si OK, -1 si error (errno se preserva).
+ * @return 0 si OK, EXIT_FAILURE si error (errno se preserva).
  */
 static int write_all(int fd, const void *buf, size_t n) {
     const char *p = (const char *)buf;
@@ -96,7 +96,7 @@ static int write_all(int fd, const void *buf, size_t n) {
         ssize_t w = write(fd, p, left);
         if (w < 0) {
             if (errno == EINTR) continue; /* reintentar si se interrumpe */
-            return -1;
+            return EXIT_FAILURE;
         }
         p += (size_t)w;
         left -= (size_t)w;
@@ -224,3 +224,106 @@ int miner_run(int write_fd, int read_fd, uint32_t target_ini, int rounds, int n_
     free(args);
     return EXIT_SUCCESS;
 }
+
+int miner_add_system(const char *filename){
+    int fd;
+    char buffer[32];
+    int len;
+
+    if (!filename){
+        return EXIT_FAILURE;
+    }
+
+    fd = open(filename, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0){
+        return EXIT_FAILURE;
+    }
+
+    len = sprintf(buffer, "%d\n", getpid());
+    write(fd, buffer, len);
+
+    close(fd);
+    return EXIT_SUCCESS;
+}
+
+int miner_del_system(const char *filename) {
+    if (!filename) return EXIT_FAILURE;
+
+    int fd;
+    char buffer[1024]; // Ajustar tamaño según necesidad
+    char new_content[1024] = "";
+    char my_pid_str[16];
+    ssize_t bytes_read;
+    
+    sprintf(my_pid_str, "%d", getpid()); // Obtenemos nuestro PID como string 
+
+    /* Leer el contenido actual */
+    fd = open(filename, O_RDONLY);
+    if (fd < 0) return EXIT_FAILURE;
+
+    bytes_read = read(fd, buffer, sizeof(buffer) - 1);
+    if (bytes_read < 0) {
+        close(fd);
+        return EXIT_FAILURE;
+    }
+    buffer[bytes_read] = '\0';
+    close(fd);
+
+    /* Filtrar el contenido (usando strtok para procesar línea a línea) */
+    char *line = strtok(buffer, "\n");
+    while (line != NULL) {
+        if (strcmp(line, my_pid_str) != 0) {
+            strcat(new_content, line);
+            strcat(new_content, "\n");
+        }
+        line = strtok(NULL, "\n");
+    }
+
+    /* Sobrescribir el archivo con el contenido filtrado */
+    fd = open(filename, O_WRONLY | O_TRUNC);
+    if (fd < 0) return EXIT_FAILURE;
+
+    if (write(fd, new_content, strlen(new_content)) < 0) {
+        close(fd);
+        return EXIT_FAILURE;
+    }
+
+    close(fd);
+    return 0;
+}
+
+/**
+ * @brief Cuenta los mineros (líneas) en el fichero usando llamadas al sistema.
+ * @param filename Nombre del fichero de PIDs.
+ * @return Número de mineros o EXIT_FAILURE si hay error.
+ */
+int count_miners_file(char *filename) {
+    int fd;
+    ssize_t bytes_read;
+    char buffer;
+    int count = 0;
+
+    /* Abrimos en modo solo lectura usando la llamada al sistema open */
+    fd = open(filename, O_RDONLY);
+    if (fd < 0) {
+        /* Si no existe el fichero, hay 0 mineros */
+        return 0;
+    }
+
+    /* Leemos el fichero carácter por carácter */
+    while ((bytes_read = read(fd, &buffer, 1)) > 0) {
+        if (buffer == '\n') {
+            count++;
+        }
+    }
+
+    if (bytes_read < 0) {
+        close(fd);
+        return EXIT_FAILURE; 
+    }
+
+    close(fd);
+    return count;
+}
+
+

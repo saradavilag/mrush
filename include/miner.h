@@ -16,6 +16,8 @@
 
  #ifndef MINER_H
  #define MINER_H
+
+ #define FILENAME "PID_miners.txt"
  
  #include <stdio.h>      /* fprintf, perror */
  #include <stdlib.h>     /* EXIT_SUCCESS, EXIT_FAILURE */
@@ -23,6 +25,7 @@
  #include <unistd.h>     /* write, close */
  
  #include <pthread.h>    /* pthread_create, pthread_join, etc */
+ #include <semaphore.h>
  
  #include "logger.h"     /* logger_run (en caso de necesitar en main) / log_args */
  #include "pow.h"        /* pow_hash, POW_LIMIT */
