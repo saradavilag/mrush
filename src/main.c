@@ -1,7 +1,7 @@
 /**
  * @file main.c
  * @author Sara, Marco
- * @date 2026-03-04
+ * @date 2026-04-02
  * @brief Punto de entrada del programa ./miner (Miner Rush - minero único).
  *
  * Responsabilidades:
@@ -17,91 +17,184 @@
  *  - sys/wait.h: waitpid y macros WIFEXITED/WEXITSTATUS.
  */
 
+#include <errno.h>
+#include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>   /* EXIT_SUCCESS/FAILURE, strtoul/strtol */
-#include <stdint.h>   /* uint32_t */
-#include <unistd.h>   /* pipe, fork, close */
-#include <sys/wait.h> /* waitpid, WIFEXITED, WEXITSTATUS */
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
-#include "miner.h"
+#include "managers.h"
+
+static volatile sig_atomic_t stop_flag = 0;
+static volatile sig_atomic_t got_sigusr1 = 0;
+static volatile sig_atomic_t got_sigusr2 = 0;
+
+static void handle_alarm(int sig) {
+    (void)sig;
+    stop_flag = 1;
+}
+
+static void handle_sigusr1(int sig) {
+    (void)sig;
+    got_sigusr1 = 1;
+}
+
+static void handle_sigusr2(int sig) {
+    (void)sig;
+    got_sigusr2 = 1;
+}
+
+static int install_handler(int signum, void (*handler)(int)) {
+    struct sigaction act;
+
+    memset(&act, 0, sizeof(act));
+    act.sa_handler = handler;
+    sigemptyset(&(act.sa_mask));
+    act.sa_flags = 0;
+
+    if (sigaction(signum, &act, NULL) == -1) {
+        perror("sigaction");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int send_sigusr1_to_others(sem_t *miners_sem, pid_t self) {
+    pid_t pids[MAX_MINERS];
+    size_t count = 0;
+
+    if (managers_read_pids(miners_sem, pids, MAX_MINERS, &count) == -1) {
+        return -1;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        if (pids[i] != self) {
+            if (kill(pids[i], SIGUSR1) == -1) {
+                if (errno != ESRCH) {
+                    perror("kill SIGUSR1");
+                    return -1;
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+
+static int current_miner_count(sem_t *miners_sem, size_t *count) {
+    pid_t pids[MAX_MINERS];
+    return managers_read_pids(miners_sem, pids, MAX_MINERS, count);
+}
 
 int main(int argc, char *argv[]) {
+    long n_secs;
+    long n_threads;
+    pid_t self = getpid();
+    sem_t *miners_sem = NULL;
+    sem_t *target_sem = NULL;
+    int is_first_miner = 0;
+    int first_round_started = 0;
+    uint32_t target = 0;
+    size_t count = 0;
 
-    /* Validación de argumentos según enunciado:
-    ./miner <TARGET_INI> <ROUNDS> <N_THREADS> */
-    if (argc != 4) {
-        fprintf(stderr, "Usage: ./miner <TARGET_INI> <ROUNDS> <N_THREADS>\n");
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s <N_SECS> <N_THREADS>\n", argv[0]);
         return EXIT_FAILURE;
     }
 
-    /* Parseo de parámetros:
-    - TARGET_INI es uint32_t
-    - ROUNDS y N_THREADS son enteros */
-    uint32_t target_ini = (uint32_t)strtoul(argv[1], NULL, 10);
-    int rounds = (int)strtol(argv[2], NULL, 10);
-    int n_threads = (int)strtol(argv[3], NULL, 10);
+    n_secs = strtol(argv[1], NULL, 10);
+    n_threads = strtol(argv[2], NULL, 10);
 
-    /* Tuberías:
-    m2l: canal Miner -> Logger (envío de log_args)
-    l2m: canal Logger -> Miner (ACK opcional; en esta versión no la usamos) */
-    int m2l[2]; // miner -> logger
-    int l2m[2]; // logger -> miner
-
-    if (pipe(m2l) == -1) {
-        perror("pipe m2l");
+    if (n_secs <= 0 || n_threads <= 0) {
+        fprintf(stderr, "Both <N_SECS> and <N_THREADS> must be > 0\n");
         return EXIT_FAILURE;
     }
 
-    if (pipe(l2m) == -1) {
-        perror("pipe l2m");
+    if (install_handler(SIGALRM, handle_alarm) == -1) {
         return EXIT_FAILURE;
     }
 
-    pid_t pid = fork();
-    if (pid < 0) {
-        perror("fork");
+    if (install_handler(SIGUSR1, handle_sigusr1) == -1) {
         return EXIT_FAILURE;
     }
 
-    /* ----------------- LOGGER (proceso hijo) -------------- */
-    if (pid == 0) {
-
-        /* Cerrar extremos no utilizados para evitar bloqueos y fugas de FDs:
-        - El logger solo lee de m2l[0], por tanto cierra m2l[1].
-        - Si no usamos ACK, también podemos cerrar el extremo de lectura del canal inverso. */
-        close(m2l[1]); // el logger no escribe al canal miner->logger
-        close(l2m[0]); // el logger no lee ACK (canal inverso)
-
-        int status = logger_run(m2l[0], l2m[1]);
-
-        /* Cierre explicito antes de terminar */
-        close(m2l[0]);
-        close(l2m[1]);
-
-        exit(status);
+    if (install_handler(SIGUSR2, handle_sigusr2) == -1) {
+        return EXIT_FAILURE;
     }
 
-    /*-------------------- MINER (proceso padre) --------------------- */
-    close(m2l[0]); // el minero no lee del canal miner->logger
-    close(l2m[1]); // el minero no escribe ACK
-
-    /* Ejecutar minado (sale EXIT_FAILURE si hay errores internos) */
-    if (miner_run(m2l[1], l2m[0], target_ini, rounds, n_threads) == EXIT_FAILURE)
+    if (managers_open_all(&miners_sem, &target_sem) == -1) {
         return EXIT_FAILURE;
+    }
 
-    /* Señal de EOF al logger: cerrar extremo de escritura */
-    close(m2l[1]);
-    close(l2m[0]);
+    if (managers_add_miner(miners_sem, self, &is_first_miner) == -1) {
+        managers_close_all(miners_sem, target_sem);
+        return EXIT_FAILURE;
+    }
 
-    /* Esperar al proceso logger y reportar estado */
-    int st;
-    waitpid(pid, &st, 0);
+    if (is_first_miner) {
+        if (target_init_if_needed(target_sem) == -1) {
+            managers_remove_miner(miners_sem, self);
+            managers_close_all(miners_sem, target_sem);
+            return EXIT_FAILURE;
+        }
+    }
 
-    if (WIFEXITED(st))
-        printf("Logger exited with status %d\n", WEXITSTATUS(st));
-    else
-        printf("Logger exited unexpectedly\n");
+    alarm((unsigned int)n_secs);
 
-    printf("Miner exited with status 0\n");
+    while (!stop_flag) {
+        if (current_miner_count(miners_sem, &count) == -1) {
+            break;
+        }
+
+        if (count < 2) {
+            usleep(200000);
+            continue;
+        }
+
+        if (is_first_miner && !first_round_started) {
+            if (send_sigusr1_to_others(miners_sem, self) == -1) {
+                break;
+            }
+            got_sigusr1 = 1;
+            first_round_started = 1;
+        }
+
+        if (!got_sigusr1) {
+            pause();
+            continue;
+        }
+
+        got_sigusr1 = 0;
+
+        if (target_read(target_sem, &target) == -1) {
+            break;
+        }
+
+        printf("Miner %d starts round with target %u and %ld threads\n",
+               (int)self, target, n_threads);
+        fflush(stdout);
+
+        /*
+         * Fase actual del apartado b):
+         * solo arrancamos ronda y demostramos que todos reciben SIGUSR1
+         * y leen el mismo target.
+         *
+         * La lógica de ganador + votación vendrá después.
+         */
+        pause();
+    }
+
+    if (managers_remove_miner(miners_sem, self) == -1) {
+        managers_close_all(miners_sem, target_sem);
+        return EXIT_FAILURE;
+    }
+
+    if (managers_close_all(miners_sem, target_sem) == -1) {
+        return EXIT_FAILURE;
+    }
+
     return EXIT_SUCCESS;
 }
