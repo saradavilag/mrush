@@ -2,7 +2,7 @@ CC      := gcc
 CFLAGS  := -Wall -Wextra -Wpedantic -O2 -Iinclude
 LDFLAGS := -pthread
 
-SRC := src/main.c src/managers.c src/pow.c
+SRC := src/main.c src/managers.c src/pow.c src/logger.c
 OBJ := $(SRC:.c=.o)
 BIN := miner
 

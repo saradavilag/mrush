@@ -34,12 +34,15 @@
   *  - valid: 1 si se considera validada, 0 si se marca como rechazada (en esta iteración
   *           puede forzarse para pruebas según el enunciado).
   */
- typedef struct _log_args{
-     int round;          /** Número de ronda */
-     uint32_t target;    /** Objetivo de la ronda */
-     uint32_t solution;  /** Solución encontrada */
-     int valid;          /** 1 = validated, 0 = rejected */
- } log_args;
+ typedef struct _log_args {
+    int round;          /** Número de ronda (o -1 para finalizar el logger) */
+    uint32_t target;    /** Objetivo de la ronda */
+    uint32_t solution;  /** Solución encontrada */
+    int valid;          /** 1 = validated, 0 = rejected */
+    int votes_yes;      /** Número de votos a favor ('Y') recibidos */
+    int total_votes;    /** Número total de votos emitidos en la ronda */
+    int coins;          /** Monedas acumuladas por este minero hasta el momento */
+} log_args;
  
  /**
   * @struct worker_args

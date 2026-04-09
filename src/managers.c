@@ -1,3 +1,14 @@
+/**
+ * @file managers.c
+ * @author Sara, Marco
+ * @date 2026-04-02
+ * @brief Implementación del gestor de recursos compartidos (Ficheros y Semáforos).
+ *
+ * Este módulo abstrae el acceso concurrente a la "base de datos" basada en ficheros
+ * de la red Blockchain: el censo de mineros, la información de la ronda actual y la
+ * urna de votaciones. Todo el acceso a disco está protegido por semáforos POSIX.
+ */
+
 #include "managers.h"
 
 #include <errno.h>
@@ -8,6 +19,17 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+/**
+ * @brief Lee los PIDs del fichero de mineros (Función interna sin protección).
+ *
+ * Esta función asume que el hilo llamador ya ha hecho un wait() sobre el
+ * semáforo correspondiente. Lee el contenido del fichero línea a línea.
+ *
+ * @param pids Array de salida donde se guardarán los PIDs leídos.
+ * @param max_pids Capacidad máxima del array.
+ * @param count Puntero para devolver la cantidad de PIDs leídos.
+ * @return 0 en caso de éxito, -1 si ocurre un error de E/S.
+ */
 static int read_pids_unlocked(pid_t pids[], size_t max_pids, size_t *count) {
     FILE *f;
     pid_t pid;
@@ -44,6 +66,15 @@ static int read_pids_unlocked(pid_t pids[], size_t max_pids, size_t *count) {
     return 0;
 }
 
+/**
+ * @brief Sobrescribe el fichero de mineros con una nueva lista (Función interna sin protección).
+ *
+ * Asume que el semáforo ya está adquirido. Trunca el fichero y escribe los PIDs.
+ *
+ * @param pids Array que contiene los PIDs a escribir.
+ * @param count Número de elementos válidos en el array.
+ * @return 0 en caso de éxito, -1 si ocurre un error de escritura.
+ */
 static int write_pids_unlocked(const pid_t pids[], size_t count) {
     FILE *f = fopen(MINERS_FILE, "w");
     if (f == NULL) {
@@ -67,6 +98,14 @@ static int write_pids_unlocked(const pid_t pids[], size_t count) {
     return 0;
 }
 
+/**
+ * @brief Busca un PID dentro de un array.
+ *
+ * @param pids Array de PIDs donde buscar.
+ * @param count Número de elementos en el array.
+ * @param pid PID específico que se quiere encontrar.
+ * @return 1 si el PID está en la lista, 0 en caso contrario.
+ */
 static int pid_in_list(const pid_t pids[], size_t count, pid_t pid) {
     for (size_t i = 0; i < count; ++i) {
         if (pids[i] == pid) {
@@ -76,6 +115,15 @@ static int pid_in_list(const pid_t pids[], size_t count, pid_t pid) {
     return 0;
 }
 
+/**
+ * @brief Abre y crea (si no existen) todos los semáforos POSIX necesarios.
+ *
+ * @param miners_sem Puntero doble donde se guardará el semáforo del censo.
+ * @param target_sem Puntero doble donde se guardará el semáforo de la ronda/target.
+ * @param votes_sem Puntero doble donde se guardará el semáforo de las votaciones.
+ * @param winner_sem Puntero doble donde se guardará el semáforo para exclusión del ganador.
+ * @return 0 si se abren correctamente, -1 si falla alguno (cerrando los anteriores).
+ */
 int managers_open_all(sem_t **miners_sem, sem_t **target_sem,
                       sem_t **votes_sem, sem_t **winner_sem) {
     *miners_sem = sem_open(MINERS_SEM_NAME, O_CREAT, S_IRUSR | S_IWUSR, 1);
@@ -111,6 +159,15 @@ int managers_open_all(sem_t **miners_sem, sem_t **target_sem,
     return 0;
 }
 
+/**
+ * @brief Cierra las referencias locales de todos los semáforos en el proceso actual.
+ *
+ * @param miners_sem Puntero al semáforo de mineros.
+ * @param target_sem Puntero al semáforo de target.
+ * @param votes_sem Puntero al semáforo de votaciones.
+ * @param winner_sem Puntero al semáforo del ganador.
+ * @return 0 en caso de éxito, -1 si algún cierre falla.
+ */
 int managers_close_all(sem_t *miners_sem, sem_t *target_sem,
                        sem_t *votes_sem, sem_t *winner_sem) {
     if (miners_sem != NULL && sem_close(miners_sem) == -1) {
@@ -132,6 +189,12 @@ int managers_close_all(sem_t *miners_sem, sem_t *target_sem,
     return 0;
 }
 
+/**
+ * @brief Imprime por salida estándar la lista actual de mineros registrados.
+ *
+ * @param pids Array con los PIDs a imprimir.
+ * @param count Número de PIDs a imprimir.
+ */
 void managers_print_miners(const pid_t pids[], size_t count) {
     printf("Current miners:");
     if (count == 0) {
@@ -145,6 +208,17 @@ void managers_print_miners(const pid_t pids[], size_t count) {
     fflush(stdout);
 }
 
+/**
+ * @brief Registra un nuevo minero en el sistema de forma segura (con exclusión mutua).
+ *
+ * Añade el PID proporcionado al fichero de mineros. Además, informa a través
+ * del puntero si este minero es el primero en arrancar la red.
+ *
+ * @param miners_sem Semáforo que protege el acceso a MINERS_FILE.
+ * @param self PID del minero que se está añadiendo.
+ * @param is_first_miner Puntero de salida, se establece a 1 si el censo estaba vacío.
+ * @return 0 si se añadió correctamente, -1 en caso de error.
+ */
 int managers_add_miner(sem_t *miners_sem, pid_t self, int *is_first_miner) {
     pid_t pids[MAX_MINERS];
     size_t count = 0;
@@ -186,6 +260,17 @@ int managers_add_miner(sem_t *miners_sem, pid_t self, int *is_first_miner) {
     return 0;
 }
 
+/**
+ * @brief Elimina un minero del sistema y realiza la limpieza final si es el último.
+ *
+ * Borra el PID especificado del fichero de mineros con exclusión mutua.
+ * Si resulta ser el último minero en abandonar, también destruye los ficheros
+ * temporales y los semáforos POSIX del núcleo.
+ *
+ * @param miners_sem Semáforo que protege el acceso a MINERS_FILE.
+ * @param self PID del minero que se está marchando.
+ * @return 0 si se eliminó correctamente, -1 en caso de error.
+ */
 int managers_remove_miner(sem_t *miners_sem, pid_t self) {
     pid_t pids[MAX_MINERS];
     pid_t kept[MAX_MINERS];
@@ -254,6 +339,15 @@ int managers_remove_miner(sem_t *miners_sem, pid_t self) {
     return 0;
 }
 
+/**
+ * @brief Wrapper seguro para leer el censo de mineros completo.
+ *
+ * @param miners_sem Semáforo que protege el acceso.
+ * @param pids Array de salida.
+ * @param max_pids Capacidad del array.
+ * @param count Salida con la cantidad de procesos leídos.
+ * @return 0 en caso de éxito, -1 en error.
+ */
 int managers_read_pids(sem_t *miners_sem, pid_t pids[], size_t max_pids, size_t *count) {
     if (sem_wait(miners_sem) == -1) {
         perror("sem_wait miners_sem");
@@ -273,6 +367,15 @@ int managers_read_pids(sem_t *miners_sem, pid_t pids[], size_t max_pids, size_t 
     return 0;
 }
 
+/**
+ * @brief Inicializa el fichero de target y ronda si no existe.
+ *
+ * Sienta las bases (Ronda 1, Target 0) para que comience la ejecución
+ * del sistema de forma segura.
+ *
+ * @param target_sem Semáforo que protege el fichero de Target.
+ * @return 0 en caso de éxito, -1 en error.
+ */
 int target_init_if_needed(sem_t *target_sem) {
     FILE *f;
     round_info_t info = {1, 0, -1, 0};
@@ -322,6 +425,13 @@ int target_init_if_needed(sem_t *target_sem) {
     return 0;
 }
 
+/**
+ * @brief Lee la información detallada de la ronda actual de forma segura.
+ *
+ * @param target_sem Semáforo que protege el fichero.
+ * @param info Estructura de salida donde volcar los datos leídos.
+ * @return 0 en caso de éxito, -1 en error o formato inválido.
+ */
 int target_read_info(sem_t *target_sem, round_info_t *info) {
     FILE *f;
     unsigned int round, target, solution;
@@ -361,6 +471,13 @@ int target_read_info(sem_t *target_sem, round_info_t *info) {
     return 0;
 }
 
+/**
+ * @brief Escribe o actualiza la información de la ronda de forma segura.
+ *
+ * @param target_sem Semáforo que protege el fichero.
+ * @param info Estructura de origen con los datos a volcar a disco.
+ * @return 0 en caso de éxito, -1 en error.
+ */
 int target_write_info(sem_t *target_sem, const round_info_t *info) {
     FILE *f;
 
@@ -398,6 +515,12 @@ int target_write_info(sem_t *target_sem, const round_info_t *info) {
     return 0;
 }
 
+/**
+ * @brief Elimina el fichero TARGET_FILE de forma segura.
+ *
+ * @param target_sem Semáforo (puede ser NULL si ya está asegurado externamente).
+ * @return 0 en caso de éxito o inexistencia, -1 en error de unlink.
+ */
 int target_remove_if_exists(sem_t *target_sem) {
     int locked = 0;
 
@@ -423,6 +546,15 @@ int target_remove_if_exists(sem_t *target_sem) {
     return 0;
 }
 
+/**
+ * @brief Vacía completamente el contenido de la urna de votación.
+ *
+ * Se ejecuta al inicio de la validación para asegurar que no hay votos basura
+ * de rondas pasadas.
+ *
+ * @param votes_sem Semáforo que protege la urna.
+ * @return 0 en caso de éxito, -1 en error.
+ */
 int votes_reset(sem_t *votes_sem) {
     FILE *f;
 
@@ -452,6 +584,13 @@ int votes_reset(sem_t *votes_sem) {
     return 0;
 }
 
+/**
+ * @brief Introduce una papeleta (voto) en la urna compartida.
+ *
+ * @param votes_sem Semáforo que protege la urna.
+ * @param vote Carácter de votación ('Y' para válido, 'N' para falso).
+ * @return 0 en caso de éxito, -1 en error.
+ */
 int votes_add(sem_t *votes_sem, char vote) {
     FILE *f;
 
@@ -488,6 +627,17 @@ int votes_add(sem_t *votes_sem, char vote) {
     return 0;
 }
 
+/**
+ * @brief Lee la urna de votaciones, extrayendo las papeletas y realizando el recuento.
+ *
+ * @param votes_sem Semáforo que protege la urna.
+ * @param votes Array de salida donde se insertarán los votos leídos textualmente.
+ * @param max_votes Capacidad máxima del array.
+ * @param count Puntero de salida con el total de votos leídos.
+ * @param yes Puntero de salida con el acumulado de votos positivos ('Y').
+ * @param no Puntero de salida con el acumulado de votos negativos ('N').
+ * @return 0 en caso de éxito, -1 en error.
+ */
 int votes_read(sem_t *votes_sem, char votes[], size_t max_votes,
                size_t *count, int *yes, int *no) {
     FILE *f;
@@ -536,6 +686,12 @@ int votes_read(sem_t *votes_sem, char votes[], size_t max_votes,
     return 0;
 }
 
+/**
+ * @brief Elimina el fichero de votaciones (urna) de forma segura.
+ *
+ * @param votes_sem Semáforo (puede ser NULL si ya está protegido externamente).
+ * @return 0 en caso de éxito o inexistencia, -1 en error de unlink.
+ */
 int votes_remove_if_exists(sem_t *votes_sem) {
     int locked = 0;
 

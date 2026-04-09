@@ -129,10 +129,10 @@ int logger_run(int read_fd, int write_fd) {
             msg.target,
             msg.solution,
             msg.valid ? "validated" : "rejected",
-            msg.round,
-            msg.round,
+            msg.votes_yes,
+            msg.total_votes,
             parent_pid,
-            msg.round) < 0)
+            msg.coins) < 0)
         {
             perror("dprintf");
             close(log_fd);

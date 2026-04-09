@@ -5,16 +5,16 @@
  * @brief Punto de entrada del programa ./miner (Miner Rush - minero único).
  *
  * Responsabilidades:
- *  - Parsear argumentos de línea de comandos: TARGET_INI, ROUNDS, N_THREADS.
- *  - Crear las tuberías necesarias para la comunicación Miner -> Logger (y canal inverso).
- *  - Crear el proceso Logger con fork().
- *  - Ejecutar el minado (miner_run) en el proceso padre.
- *  - Esperar al proceso Logger y mostrar su código de salida según el enunciado.
+ * - Parsear argumentos de línea de comandos: TARGET_INI, ROUNDS, N_THREADS.
+ * - Crear las tuberías necesarias para la comunicación Miner -> Logger (y canal inverso).
+ * - Crear el proceso Logger con fork().
+ * - Ejecutar el minado (miner_run) en el proceso padre.
+ * - Esperar al proceso Logger y mostrar su código de salida según el enunciado.
  *
  * Dependencias:
- *  - miner.h: interfaz del minero.
- *  - logger.h: interfaz del logger (incluida por miner.h).
- *  - sys/wait.h: waitpid y macros WIFEXITED/WEXITSTATUS.
+ * - miner.h: interfaz del minero.
+ * - logger.h: interfaz del logger (incluida por miner.h).
+ * - sys/wait.h: waitpid y macros WIFEXITED/WEXITSTATUS.
  */
 
 #include <errno.h>
@@ -25,9 +25,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <semaphore.h>
+#include <fcntl.h>
+#include <sys/wait.h> 
 
 #include "managers.h"
 #include "pow.h"
+#include "logger.h"   
 
 #define VOTE_WAIT_TRIES 30
 #define VOTE_WAIT_USEC 100000
@@ -45,21 +49,55 @@ typedef struct {
     pthread_mutex_t *mutex;
 } worker_args_t;
 
+/**
+ * @brief Manejador para la señal de temporización (SIGALRM).
+ *
+ * Activa el flag global de parada cuando el proceso minero ha agotado
+ * su tiempo de vida estipulado por los argumentos de entrada.
+ *
+ * @param sig Número de la señal recibida (ignorado en el cuerpo).
+ */
 static void handle_alarm(int sig) {
     (void)sig;
     stop_flag = 1;
 }
 
+/**
+ * @brief Manejador para la señal de inicio de ronda (SIGUSR1).
+ *
+ * Activa un flag indicando que un minero ha dado el pistoletazo de salida
+ * para que todos comiencen a calcular el Proof of Work.
+ *
+ * @param sig Número de la señal recibida (ignorado en el cuerpo).
+ */
 static void handle_sigusr1(int sig) {
     (void)sig;
     got_sigusr1 = 1;
 }
 
+/**
+ * @brief Manejador para la señal de alto el fuego (SIGUSR2).
+ *
+ * Activa un flag indicando que algún minero de la red ha encontrado
+ * una solución válida, por lo que se debe abortar el minado actual y pasar a votar.
+ *
+ * @param sig Número de la señal recibida (ignorado en el cuerpo).
+ */
 static void handle_sigusr2(int sig) {
     (void)sig;
     got_sigusr2 = 1;
 }
 
+/**
+ * @brief Instala un manejador para una señal específica.
+ *
+ * Envuelve la llamada a sigaction() garantizando que la máscara inicial 
+ * y las banderas (flags) de la señal queden a cero de forma segura.
+ *
+ * @param signum Número identificador de la señal a capturar.
+ * @param handler Puntero a la función manejadora de la señal.
+ * @return 0 en caso de éxito, -1 si ocurre un error (errno preservado).
+ */
 static int install_handler(int signum, void (*handler)(int)) {
     struct sigaction act;
 
@@ -75,6 +113,42 @@ static int install_handler(int signum, void (*handler)(int)) {
     return 0;
 }
 
+/**
+ * @brief Escribe exactamente n bytes en un descriptor de fichero.
+ *
+ * Previene el problema de las escrituras parciales en tuberías (pipes) 
+ * iterando llamadas a write() hasta haber volcado el buffer completo.
+ *
+ * @param fd Descriptor de fichero donde escribir (extremo de escritura del pipe).
+ * @param buf Puntero al inicio de los datos a escribir.
+ * @param n Número exacto de bytes que se deben transferir.
+ * @return 0 si se han escrito todos los bytes con éxito, -1 en caso de error grave.
+ */
+static int write_all(int fd, const void *buf, size_t n) {
+    const char *p = (const char *)buf;
+    size_t left = n;
+    while (left > 0) {
+        ssize_t w = write(fd, p, left);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        p += (size_t)w;
+        left -= (size_t)w;
+    }
+    return 0;
+}
+
+/**
+ * @brief Tarea ejecutada concurrentemente por cada hilo minero.
+ *
+ * Recorre un fragmento del espacio de búsqueda comprobando el hash. Si encuentra
+ * la coincidencia, adquiere el mutex para apuntar la solución de forma segura 
+ * y avisa a los demás alterando el flag atómico compartido.
+ *
+ * @param arg Puntero genérico a la estructura worker_args_t con los límites y variables compartidas.
+ * @return NULL al finalizar el trabajo.
+ */
 static void *worker(void *arg) {
     worker_args_t *a = (worker_args_t *)arg;
 
@@ -101,6 +175,17 @@ static void *worker(void *arg) {
     return NULL;
 }
 
+/**
+ * @brief Gestiona el proceso de minado distribuyendo el trabajo en hilos.
+ *
+ * Divide equitativamente el espacio de búsqueda (POW_LIMIT) entre el número de hilos 
+ * especificado, los lanza y espera a que terminen mediante pthread_join.
+ *
+ * @param target Número objetivo (hash) que se debe conseguir en esta ronda.
+ * @param n_threads Cantidad de hilos (trabajadores) a generar.
+ * @param solution Puntero donde se almacenará el número origen que generó el hash correcto.
+ * @return 1 si se encontró la solución, 0 si el rango se agotó sin éxito, -1 si falló la creación de hilos.
+ */
 static int mine_solution(uint32_t target, int n_threads, uint32_t *solution) {
     pthread_t *tids = NULL;
     worker_args_t *args = NULL;
@@ -152,6 +237,18 @@ static int mine_solution(uint32_t target, int n_threads, uint32_t *solution) {
     return found ? 1 : 0;
 }
 
+/**
+ * @brief Difunde una señal a todos los mineros de la red.
+ *
+ * Emite la señal indicada a todos los procesos registrados en el vector 
+ * de asistentes, excluyendo deliberadamente al propio emisor.
+ *
+ * @param pids Array que contiene los IDs de los procesos mineros conectados.
+ * @param count Cantidad actual de elementos útiles en el array.
+ * @param self ID del proceso actual (para evitar enviarse la señal a sí mismo).
+ * @param signum Señal que se desea propagar (e.g., SIGUSR1 o SIGUSR2).
+ * @return 0 en caso de éxito global, -1 si falla el envío a un proceso vivo.
+ */
 static int send_signal_to_list(const pid_t pids[], size_t count, pid_t self, int signum) {
     for (size_t i = 0; i < count; ++i) {
         if (pids[i] == self) continue;
@@ -165,14 +262,43 @@ static int send_signal_to_list(const pid_t pids[], size_t count, pid_t self, int
     return 0;
 }
 
+/**
+ * @brief Wrapper seguro para contar el censo de mineros actuales.
+ *
+ * Utiliza la infraestructura del manager (y sus semáforos) para recuperar la lista 
+ * actualizada de participantes desde el archivo MINERS_FILE.
+ *
+ * @param miners_sem Semáforo POSIX que protege la lista global de mineros.
+ * @param count Puntero de salida donde se guardará el número de mineros contados.
+ * @param pids Array de salida donde se cargarán los PIDs leídos.
+ * @return 0 en caso de éxito, -1 si ocurre un error de lectura o bloqueo.
+ */
 static int count_miners(sem_t *miners_sem, size_t *count, pid_t pids[]) {
     return managers_read_pids(miners_sem, pids, MAX_MINERS, count);
 }
 
+/**
+ * @brief Valida criptográficamente una solución ajena (Proceso de consenso).
+ *
+ * Ejecuta la prueba de trabajo sobre la propuesta de otro minero para dictaminar
+ * si el voto individual será positivo ('Y') o negativo ('N').
+ *
+ * @param target Objetivo que debía ser resuelto en la ronda actual.
+ * @param solution Solución reclamada por el minero ganador temporal.
+ * @return 'Y' (carácter ASCII) si la prueba matemática es correcta, 'N' en caso contrario.
+ */
 static int vote_validity(uint32_t target, uint32_t solution) {
     return ((uint32_t)pow_hash((long int)solution) == target) ? 'Y' : 'N';
 }
 
+/**
+ * @brief Muestra por salida estándar el resumen gráfico del recuento de una votación.
+ *
+ * @param winner PID del minero sometido a escrutinio.
+ * @param votes Array con las papeletas literales registradas ('Y' y 'N').
+ * @param count Total de papeletas recuperadas de la urna.
+ * @param accepted Entero booleano (1 si la propuesta superó la votación, 0 si no).
+ */
 static void print_votes_line(pid_t winner, const char votes[], size_t count, int accepted) {
     printf("Winner %d => [", (int)winner);
     for (size_t i = 0; i < count; ++i) {
@@ -185,13 +311,32 @@ static void print_votes_line(pid_t winner, const char votes[], size_t count, int
 sem_t *mutex = NULL;
 int n_miners = 0;
 
+/**
+ * @brief Función de inicialización base (Auxiliar).
+ *
+ * Abre o crea un semáforo POSIX genérico de exclusión mutua ("mutex") 
+ * verificando los errores de sem_open.
+ *
+ * @return EXIT_SUCCESS si el semáforo se levanta correctamente, EXIT_FAILURE si falla.
+ */
 int init_system(){
-    if (mutex = sem_open("mutex", O_CREAT | O_EXCL, 0644, 1) == NULL){
+    if ((mutex = sem_open("mutex", O_CREAT | O_EXCL, 0644, 1)) == SEM_FAILED){
         return EXIT_FAILURE;
     }
-
+    return EXIT_SUCCESS;
 }
 
+/**
+ * @brief Bucle principal de la aplicación minero.
+ *
+ * Orquesta la lógica del programa: parseo de argumentos, creación del registrador (Logger),
+ * gestión de la señal SIGALRM, y el bucle infinito de rondas blockchain (minado, proclamación
+ * de victoria y validación por consenso).
+ *
+ * @param argc Cantidad de argumentos pasados por consola.
+ * @param argv Valores de los argumentos (1: segundos de vida, 2: número de hilos).
+ * @return EXIT_SUCCESS al completar el ciclo de vida sin errores críticos.
+ */
 int main(int argc, char *argv[]) {
     long n_secs;
     long n_threads;
@@ -206,6 +351,8 @@ int main(int argc, char *argv[]) {
     pid_t participants[MAX_MINERS];
     size_t participants_count = 0;
     round_info_t info;
+
+    sigset_t block_mask, susp_mask;
 
     if (argc != 3) {
         fprintf(stderr, "Usage: %s <N_SECS> <N_THREADS>\n", argv[0]);
@@ -223,6 +370,37 @@ int main(int argc, char *argv[]) {
     if (install_handler(SIGALRM, handle_alarm) == -1) return EXIT_FAILURE;
     if (install_handler(SIGUSR1, handle_sigusr1) == -1) return EXIT_FAILURE;
     if (install_handler(SIGUSR2, handle_sigusr2) == -1) return EXIT_FAILURE;
+
+    sigemptyset(&block_mask);
+    sigaddset(&block_mask, SIGUSR1);
+    sigaddset(&block_mask, SIGUSR2);
+
+    if (sigprocmask(SIG_BLOCK, &block_mask, &susp_mask) == -1) {
+        perror("sigprocmask");
+        return EXIT_FAILURE;
+    }
+
+    int pipe_fd[2];
+    pid_t logger_pid;
+
+    if (pipe(pipe_fd) == -1) {
+        perror("pipe");
+        return EXIT_FAILURE;
+    }
+
+    logger_pid = fork();
+    if (logger_pid < 0) {
+        perror("fork");
+        return EXIT_FAILURE;
+    }
+
+    if (logger_pid == 0) {
+        close(pipe_fd[1]); 
+        exit(logger_run(pipe_fd[0], -1));
+    }
+
+    close(pipe_fd[0]); 
+    int log_fd = pipe_fd[1];
 
     if (managers_open_all(&miners_sem, &target_sem, &votes_sem, &winner_sem) == -1) {
         return EXIT_FAILURE;
@@ -267,7 +445,7 @@ int main(int argc, char *argv[]) {
         }
 
         if (!got_sigusr1) {
-            pause();
+            sigsuspend(&susp_mask);
             continue;
         }
 
@@ -339,7 +517,7 @@ int main(int argc, char *argv[]) {
         }
 
         while (!got_sigusr2 && !stop_flag) {
-            pause();
+            sigsuspend(&susp_mask);
         }
 
         if (stop_flag) break;
@@ -382,6 +560,19 @@ int main(int argc, char *argv[]) {
 
             print_votes_line(info.winner, votes, votes_count, accepted);
 
+            log_args msg;
+            msg.round = info.round;
+            msg.target = info.target;
+            msg.solution = info.solution;
+            msg.valid = accepted;
+            msg.total_votes = votes_count;
+            msg.votes_yes = yes;
+            msg.coins = coins;
+            
+            if (write_all(log_fd, &msg, sizeof(msg)) == -1) {
+                perror("write_all to logger");
+            }
+
             round_info_t next = info;
             next.round = info.round + 1;
             next.winner = -1;
@@ -420,9 +611,12 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
+    log_args exit_msg;
+    exit_msg.round = -1; 
+    write_all(log_fd, &exit_msg, sizeof(exit_msg));
+    close(log_fd);
+    
+    waitpid(logger_pid, NULL, 0);
+
     return EXIT_SUCCESS;
 }
-
-
-
-
