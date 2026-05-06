@@ -93,6 +93,9 @@ typedef struct {
     sem_t sem_ready_next_round; 
     sem_t sem_loggers_printed; 
     int loggers_finished;
+
+    /* Semáforo para aceptar nuevos mineros */
+    sem_t sem_inscripcion;
 } SharedData;
 
 #endif /* MONITOR_H */

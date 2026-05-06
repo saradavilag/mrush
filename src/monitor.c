@@ -56,6 +56,7 @@ void clean_system(SharedData *shm, mqd_t mq) {
         sem_destroy(&shm->sem_data_act);
         sem_destroy(&shm->sem_loggers_printed);
         sem_destroy(&shm->sem_ready_next_round);
+        sem_destroy(&shm->sem_inscripcion);
 
         /* La desmapeamos también */
         if (munmap(shm, sizeof(SharedData)) == -1) {
@@ -122,6 +123,7 @@ int init_system(SharedData **shm_ptr, mqd_t *mq){
     sem_init(&shm->sem_ready_next_round, 1, 0);
     sem_init(&shm->sem_loggers_printed, 1, 0);
     sem_init(&shm->sem_data_act, 1, 0);
+    sem_init(&shm->sem_inscripcion, 1, 1);
 
     /* Inicializamos la primera target */
     shm->target = 0; 
@@ -192,9 +194,6 @@ void comprobador_run(SharedData *shm, mqd_t mq, int lag_comp) {
             break;
         }
 
-        /* DEBUG */
-        if (msg.is_last_miner) printf("Procesado mensaje is_last_miner");
-
         /* Preparar el bloque y validarlo */
         block.target = msg.target;
         block.solution = msg.solution;
@@ -227,6 +226,7 @@ void comprobador_run(SharedData *shm, mqd_t mq, int lag_comp) {
             }
 
             sem_post(&shm->sem_mutex_red);
+            sem_post(&shm->sem_inscripcion);
         } else {
             block.validated = 0; 
         }

@@ -103,11 +103,9 @@ int main(int argc, char *argv[]) {
     /* Preparamos las máscaras para sigsuspend */
     sigfillset(&wait_mask_usr1);
     sigdelset(&wait_mask_usr1, SIGUSR1);
-    sigdelset(&wait_mask_usr1, SIGALRM);
 
     sigfillset(&wait_mask_usr2);
     sigdelset(&wait_mask_usr2, SIGUSR2);
-    sigdelset(&wait_mask_usr2, SIGALRM);
 
     /* Abrir Memoria Compartida (El Comprobador debe haberla creado) */
     shm_fd = shm_open(SHM_NAME, O_RDWR, 0);
