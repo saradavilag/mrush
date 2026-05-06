@@ -31,6 +31,11 @@ extern volatile sig_atomic_t got_sig_usr2;
 extern sigset_t wait_mask_usr1;
 extern sigset_t wait_mask_usr2;
 
+/**
+ * @brief Función hace sem_wait de manera segura
+ *
+ * @param sem SemáforoS
+ */
 void safe_sem_wait(sem_t *sem) {
     while (sem_wait(sem) == -1) {
         if (errno == EINTR) {
@@ -113,32 +118,6 @@ static int write_all(int fd, const void *buf, size_t n) {
         left -= (size_t)w;
     }
     return 0;
-}
-
-/**
- * @brief Cuenta el número de mineros actualmente activos en la red.
- * 
- * @param shm Puntero a la estructura de Memoria Compartida.
- * @return int El número de mineros activos contados.
- */
-int count_active_miners(SharedData *shm) {
-    int count = 0;
-
-    if (!shm) return 0;
-
-    /* Protegemos la lectura del censo global */
-    safe_sem_wait(&shm->sem_mutex_red);
-
-    /* Recorremos el array de mineros activos */
-    for (int i = 0; i < MAX_MINERS_GLOBAL; i++) {
-        if (shm->active_miners[i] != 0) {
-            count++;
-        }
-    }
-
-    sem_post(&shm->sem_mutex_red);
-
-    return count;
 }
 
 /**
@@ -363,7 +342,7 @@ int miner_add_system(SharedData *shm) {
     /* Pedimos permiso a la Puerta de Inscripciones (espera no activa) */
     safe_sem_wait(&shm->sem_inscripcion);
     
-    sem_wait(&shm->sem_mutex_red); // Mutex de la red
+    safe_sem_wait(&shm->sem_mutex_red); // Mutex de la red
     
     for (int i = 0; i < MAX_MINERS_GLOBAL; i++) {
         if (shm->active_miners[i] == 0) {

@@ -41,6 +41,10 @@ void monitor_run(SharedData *shm, int lag_mon);
 /**
  * @brief Libera y elimina los recursos globales del sistema (SHM, MQ y semáforos).
  * 
+ * Se encarga de destruir todos los semáforos alojados en la memoria compartida,
+ * desmapear el segmento de memoria, eliminar el objeto SHM del sistema y 
+ * cerrar/eliminar la cola de mensajes POSIX.[cite: 15]
+ * 
  * @param shm Puntero a la estructura de memoria compartida a liberar.
  * @param mq Descriptor de la cola de mensajes a cerrar y eliminar.
  */
@@ -77,11 +81,16 @@ void clean_system(SharedData *shm, mqd_t mq) {
 /**
  * @brief Inicializa la memoria compartida (SHM), semáforos y cola de mensajes (MQ).
  * 
+ * Crea un segmento de memoria compartida con el tamaño de SharedData, lo mapea
+ * en el espacio de direcciones, inicializa todos los semáforos anónimos como 
+ * compartidos entre procesos (pshared=1) y crea la cola de mensajes con los 
+ * atributos exigidos.[cite: 15]
+ * 
  * @param shm_ptr Dirección del puntero a la estructura SharedData (salida).
  * @param mq Puntero al descriptor de la cola de mensajes (salida).
  * @return int EXIT_SUCCESS en éxito, EXIT_FAILURE si falla algún recurso.
  * 
- * @note Limpia la SHM con memset, pone target a 0 e inicializa semáforos entre procesos.
+ * @note Limpia la SHM con memset e inicializa target a 0.[cite: 15]
  */
 int init_system(SharedData **shm_ptr, mqd_t *mq){
     if (!shm_ptr) return EXIT_FAILURE;
@@ -144,6 +153,17 @@ int init_system(SharedData **shm_ptr, mqd_t *mq){
     return EXIT_SUCCESS;
 }
 
+/**
+ * @brief Punto de entrada del ejecutable monitor.
+ * 
+ * Gestiona los argumentos, inicializa los recursos globales del sistema e
+ * inicia la jerarquía de procesos: el padre ejecuta el Comprobador y el
+ * hijo el Monitor. Al finalizar, sincroniza la terminación y limpia el sistema.[cite: 15]
+ * 
+ * @param argc Número de argumentos.
+ * @param argv Array de argumentos (se esperan LAG_COMPROBADOR y LAG_MONITOR).
+ * @return int EXIT_SUCCESS o EXIT_FAILURE.
+ */
 int main(int argc, char *argv[]) {
     /* Comprobación de argumentos */
     if (argc != 3) {
@@ -181,6 +201,19 @@ int main(int argc, char *argv[]) {
     return EXIT_SUCCESS;
 }
 
+/**
+ * @brief Bucle principal del proceso Comprobador.
+ * 
+ * Recibe mensajes de los mineros a través de la cola de mensajes, valida
+ * la solución propuesta, actualiza la información global (carteras, nuevo objetivo)
+ * y deposita bloques en el buffer circular siguiendo el modelo productor-consumidor.
+ * Gestiona las barreras de sincronización para que los Loggers y Mineros puedan 
+ * procesar los resultados de la ronda antes de pasar a la siguiente.[cite: 15]
+ * 
+ * @param shm Puntero a la memoria compartida.
+ * @param mq Descriptor de la cola de mensajes.
+ * @param lag_comp Tiempo de retardo en milisegundos por iteración.
+ */
 void comprobador_run(SharedData *shm, mqd_t mq, int lag_comp) {
     Message msg;
     InfoBlock block;
@@ -267,6 +300,16 @@ void comprobador_run(SharedData *shm, mqd_t mq, int lag_comp) {
     }
 }
 
+/**
+ * @brief Bucle principal del proceso Monitor.
+ * 
+ * Actúa como consumidor del buffer circular alojado en memoria compartida.
+ * Extrae los bloques depositados por el Comprobador y muestra por salida
+ * estándar si la solución fue aceptada o rechazada con el formato especificado.[cite: 15]
+ * 
+ * @param shm Puntero a la memoria compartida.
+ * @param lag_monitor Tiempo de retardo en milisegundos por iteración.
+ */
 void monitor_run(SharedData *shm, int lag_monitor) {
     InfoBlock block;
 

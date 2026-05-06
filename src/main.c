@@ -38,7 +38,13 @@ sigset_t wait_mask_usr1;
 sigset_t wait_mask_usr2;
 
 /**
- * @brief Manejador para señales de finalización (SIGALRM / SIGINT)
+ * @brief Manejador para señales de finalización.
+ * 
+ * Se ejecuta al recibir SIGALRM (fin de tiempo del minero) o SIGINT (Ctrl+C).
+ * Activa la bandera global got_sig_exit para que el minero abandone el bucle
+ * de minado limpiamente en la siguiente comprobación.
+ * 
+ * @param sig Número de la señal recibida.
  */
 static void handle_exit_sig(int sig) {
     (void)sig;
@@ -46,8 +52,13 @@ static void handle_exit_sig(int sig) {
 }
 
 /**
- * @brief Manejador vacío para despertar del sigsuspend (SIGUSR1)
- * El Comprobador envía esta señal para avisar de que ha procesado la ronda.
+ * @brief Manejador para despertar del sigsuspend (Votación).
+ * 
+ * Se ejecuta al recibir SIGUSR2. El minero ganador envía esta señal a la red 
+ * para avisar de que ha encontrado una solución y se debe proceder a votar.
+ * Cambia la bandera got_sig_usr2 para interrumpir los hilos de búsqueda.
+ * 
+ * @param sig Número de la señal recibida.
  */
 static void handle_usr2(int sig) {
     (void)sig; 
@@ -55,13 +66,29 @@ static void handle_usr2(int sig) {
 }
 
 /**
- * @brief Manejador vacío para despertar del sigsuspend (SIGUSR2)
- * El minero ganador envía esta señal para avisar de la votación
+ * @brief Manejador vacío para despertar del sigsuspend (Nueva Ronda).
+ * 
+ * Se ejecuta al recibir SIGUSR1. El minero ganador de la ronda anterior 
+ * envía esta señal para dar el pistoletazo de salida a la nueva ronda.
+ * No necesita modificar variables, solo interrumpir el sigsuspend.
+ * 
+ * @param sig Número de la señal recibida.
  */
 static void handle_usr1(int sig) {
     (void)sig;
 }
 
+/**
+ * @brief Función principal del proceso Minero.
+ * 
+ * Configura el entorno del minero (IPC, señales, procesos hijos) y delega
+ * la lógica de minado a la función miner_run(). Al finalizar, limpia los 
+ * recursos locales y avisa al sistema de su salida.
+ * 
+ * @param argc Número de argumentos pasados por línea de comandos.
+ * @param argv Array de argumentos. Se esperan <N_SECS> y <N_THREADS>.
+ * @return EXIT_SUCCESS si el programa finaliza correctamente, EXIT_FAILURE en caso de error.
+ */
 int main(int argc, char *argv[]) {
     long n_secs, n_threads;
     int shm_fd;
@@ -79,6 +106,13 @@ int main(int argc, char *argv[]) {
     n_secs = strtol(argv[1], NULL, 10);
     n_threads = strtol(argv[2], NULL, 10);
 
+    /* BLOQUEAMOS las señales fuera del sigsuspend para no perderlas en posibles condiciones de carrera */
+    sigset_t block_mask;
+    sigemptyset(&block_mask);
+    sigaddset(&block_mask, SIGUSR1);
+    sigaddset(&block_mask, SIGUSR2);
+    sigprocmask(SIG_BLOCK, &block_mask, NULL);
+    
     /* 2. Configuración estricta de señales */
     struct sigaction act = {0};
     act.sa_handler = handle_exit_sig;
@@ -92,13 +126,6 @@ int main(int argc, char *argv[]) {
     struct sigaction act_usr2 = {0};
     act_usr2.sa_handler = handle_usr2;
     sigaction(SIGUSR2, &act_usr2, NULL);
-
-    /* BLOQUEAMOS las señales fuera del sigsuspend para no perderlas en posibles condiciones de carrera */
-    sigset_t block_mask;
-    sigemptyset(&block_mask);
-    sigaddset(&block_mask, SIGUSR1);
-    sigaddset(&block_mask, SIGUSR2);
-    sigprocmask(SIG_BLOCK, &block_mask, NULL);
 
     /* Preparamos las máscaras para sigsuspend */
     sigfillset(&wait_mask_usr1);
