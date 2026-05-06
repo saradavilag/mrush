@@ -20,6 +20,7 @@
  */
 
 #include "logger.h"
+#include "types.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -125,7 +126,7 @@ int logger_run(int read_fd, int write_fd) {
             "Votes : %d/%d\n"
             "Wallets : %d:%d\n\n",
             msg.round,
-            parent_pid,
+            msg.winner_pid,
             msg.target,
             msg.solution,
             msg.valid ? "validated" : "rejected",

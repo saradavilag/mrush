@@ -1,26 +1,11 @@
 /**
  * @file miner.c
  * @author Sara, Marco
- * @date 2026-03-04
- * @brief Implementación del proceso Minero multihilo (Miner Rush - ejercicio 13b).
+ * @date 2026-05-01
+ * @brief Implementación del proceso Minero multihilo adaptado a Memoria Compartida (Miner Rush - Práctica 3).
  *
- * El minero resuelve una prueba de esfuerzo (POW) por fuerza bruta. Para cada ronda:
- *  - Divide el rango [0, POW_LIMIT) en subrangos para N_THREADS hilos.
- *  - Lanza hilos en paralelo que buscan un valor s tal que pow_hash(s) == target.
- *  - En cuanto un hilo encuentra solución, se marca un flag compartido (found) para
- *    que el resto termine cuanto antes.
- *  - Se envía un mensaje log_args al Logger por una tubería.
- *
- * Decisiones de diseño relevantes:
- *  - Sincronización sin mutex: found se consulta/actualiza con operaciones atómicas GCC
- *    (__atomic_*). Evita la contención de un mutex por iteración y mejora el rendimiento.
- *  - write_all(): write() puede escribir menos bytes que los solicitados; se asegura el envío
- *    completo de sizeof(log_args) al Logger.
- *
- * Dependencias:
- *  - pow.h: pow_hash() y POW_LIMIT.
- *  - pthread: creación y sincronización de hilos.
- *  - types.h: estructuras compartidas worker_args y log_args.
+ * El minero resuelve una prueba de esfuerzo (POW) por fuerza bruta,
+ * coordinándose con una red global a través de memoria compartida y colas de mensajes.
  */
 
 #include <stdio.h>
@@ -29,16 +14,49 @@
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <mqueue.h>
+#include <semaphore.h>
+#include <pthread.h>
 
 #include "miner.h"
 #include "types.h"
 #include "pow.h"
- 
+#include "monitor.h"
+
+/* Variables globales manejadas en main.c */
+extern volatile sig_atomic_t got_sig_exit;
+extern volatile sig_atomic_t got_sig_usr2;
+extern sigset_t wait_mask_usr1;
+extern sigset_t wait_mask_usr2;
+
+/**
+ * @brief Función que envía señales a los demás mineros
+ *
+ * @param sig Señal a enviar
+ * @return Número de señales enviadas
+ */
+int send_sig_to_miners(SharedData *shm, int sig){
+
+    sem_wait(&shm->sem_mutex_red);
+
+    int active_count = 0;
+    for(int i = 0; i < MAX_MINERS_GLOBAL; i++){
+        if(shm->active_miners[i] != 0 && shm->active_miners[i] != getpid()) {
+            kill(shm->active_miners[i], sig);
+            active_count++;
+        }
+    }
+
+    sem_post(&shm->sem_mutex_red);
+
+    return active_count;
+}
+
+
 /**
  * @brief Función de trabajo de cada hilo minero.
- *
- * Cada hilo explora el rango [start, end) buscando un valor i tal que pow_hash(i) == target.
- * Consulta el flag compartido found para terminar pronto si otro hilo ya encontró solución.
  *
  * @param arg Puntero a worker_args con el rango y punteros compartidos.
  * @return NULL 
@@ -46,44 +64,27 @@
 static void *worker(void *arg) {
     worker_args *a = (worker_args *)arg;
 
-    /* Campos que pueden no usarse en esta versión (compatibilidad con types.h) */
-    (void)a->mutex;
-    (void)a->round;
-    (void)a->write_fd;
-
     for (uint32_t i = a->start; i < a->end; i++) {
-
-        /* Lectura atómica: si ya existe solución, salimos */
         int already = __atomic_load_n(a->found, __ATOMIC_ACQUIRE);
-        if (already) break;
+        if (already || got_sig_usr2 || got_sig_exit) break;
 
-        /* pow_hash trabaja con long int */
         long int h = pow_hash((long int)i);
 
         if (h == (long int)a->target) {
-            /* Intentar ser el ganador:
-            compare_exchange asegura que solo un hilo cambia found de 0 a 1. */
             int expected = 0;
-            if (__atomic_compare_exchange_n(
-                    a->found, &expected, 1,
-                    0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-                /* Este hilo ha sido el primero: publica la solución */
+            if (__atomic_compare_exchange_n(a->found, &expected, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
                 *(a->solution) = i;
             }
             break;
         }
     }
-
     return NULL;
 }
 
 /**
  * @brief Escribe exactamente n bytes en un descriptor.
  *
- * write() puede devolver escrituras parciales; esta función reintenta hasta escribir todo
- * o devolver error.
- *
- * @param fd Descriptor de fichero destino.
+ * @param fd Descriptor de fichero destino (tubería).
  * @param buf Buffer origen.
  * @param n Número de bytes a escribir.
  * @return 0 si OK, EXIT_FAILURE si error (errno se preserva).
@@ -95,7 +96,7 @@ static int write_all(int fd, const void *buf, size_t n) {
     while (left > 0) {
         ssize_t w = write(fd, p, left);
         if (w < 0) {
-            if (errno == EINTR) continue; /* reintentar si se interrumpe */
+            if (errno == EINTR) continue;
             return EXIT_FAILURE;
         }
         p += (size_t)w;
@@ -105,119 +106,225 @@ static int write_all(int fd, const void *buf, size_t n) {
 }
 
 /**
- * @brief Ejecuta el minado durante un número de rondas con N_THREADS hilos.
- *
- * @param write_fd FD para enviar mensajes log_args al Logger.
- * @param read_fd  FD para leer ACK del Logger (no usado en esta versión).
- * @param target_ini Target inicial de la ronda 1.
- * @param rounds Número de rondas a minar.
- * @param n_threads Número de hilos por ronda.
- * @return EXIT_SUCCESS si todo correcto, EXIT_FAILURE si ocurre algún error.
+ * @brief Cuenta el número de mineros actualmente activos en la red.
+ * 
+ * @param shm Puntero a la estructura de Memoria Compartida.
+ * @return int El número de mineros activos contados.
  */
-int miner_run(int write_fd, int read_fd, uint32_t target_ini, int rounds, int n_threads) {
-    (void)read_fd; // No usamos ACK (por si futuras prácticas).
+int count_active_miners(SharedData *shm) {
+    int count = 0;
 
-    /* Validación mínima de parámetros */
-    if (rounds <= 0 || n_threads <= 0) {
-        fprintf(stderr, "miner_run: rounds and n_threads must be > 0\n");
-        return EXIT_FAILURE;
+    if (!shm) return 0;
+
+    /* Protegemos la lectura del censo global */
+    sem_wait(&shm->sem_mutex_red);
+
+    /* Recorremos el array de mineros activos */
+    for (int i = 0; i < MAX_MINERS_GLOBAL; i++) {
+        if (shm->active_miners[i] != 0) {
+            count++;
+        }
     }
 
-    uint32_t target = target_ini;
+    sem_post(&shm->sem_mutex_red);
+
+    return count;
+}
+
+/**
+ * @brief Ejecuta el ciclo de minado principal integrado con la red global.
+ *
+ * @param write_fd Descriptor de la tubería para enviar datos al Logger local.
+ * @param shm Puntero al bloque de memoria compartida (SharedData).
+ * @param mq Descriptor de la cola de mensajes hacia el Comprobador.
+ * @param mi_indice Posición del minero en active_miners[].
+ * @param n_threads Número de hilos lanzados por ronda de minado.
+ * @return EXIT_SUCCESS si finaliza correctamente, EXIT_FAILURE ante error.
+ */
+int miner_run(int write_fd, SharedData *shm, mqd_t mq, int mi_indice, int n_threads) {
+    if (n_threads <= 0) return EXIT_FAILURE;
 
     pthread_t *tids = calloc((size_t)n_threads, sizeof(*tids));
     worker_args *args = calloc((size_t)n_threads, sizeof(*args));
+    
     if (!tids || !args) {
-        perror("calloc");
         free(tids);
         free(args);
         return EXIT_FAILURE;
     }
 
-    for (int round = 1; round <= rounds; round++) {
+    int round = 1;
+    int i;
+
+    /* Bucle infinito controlado por señales */
+    while (!got_sig_exit) {
+      
+        /* 1. Lectura del objetivo actual (Protegida con mutex de red) */
+        sem_wait(&shm->sem_mutex_red);
+        uint32_t current_target = shm->target;
+        sem_post(&shm->sem_mutex_red);
 
         uint32_t solution = 0;
         int found = 0;
-
-        /* Particionamos [0, POW_LIMIT) en n_threads trozos:
-        - base: tamaño mínimo por hilo
-        - rem: los primeros "rem" hilos reciben 1 elemento extra (reparto equilibrado) */
+        
         uint32_t base = (uint32_t)POW_LIMIT / (uint32_t)n_threads;
         uint32_t rem  = (uint32_t)POW_LIMIT % (uint32_t)n_threads;
-
         uint32_t start = 0;
+        got_sig_usr2 = 0;
 
+        /* 2. Reparto de trabajo y lanzamiento de hilos */
         for (int k = 0; k < n_threads; k++) {
             uint32_t chunk = base + ((uint32_t)k < rem ? 1u : 0u);
-            uint32_t end = start + chunk;
-
             args[k].start = start;
-            args[k].end = end;
-            args[k].target = target;
-
+            args[k].end = start + chunk;
+            args[k].target = current_target;
             args[k].solution = &solution;
             args[k].found = &found;
-
-            /* mutex no usado, mantenido por compatibilidad con worker_args */
-            args[k].mutex = NULL;
-
-            /* campos auxiliares no usados en worker en esta versión */
-            args[k].round = round;
-            args[k].write_fd = write_fd;
-
-            int err = pthread_create(&tids[k], NULL, worker, &args[k]);
-            if (err != 0) {
-                fprintf(stderr, "pthread_create: %s\n", strerror(err));
-                /* esperar a los hilos ya creados para limpiar */
-                for (int j = 0; j < k; j++) pthread_join(tids[j], NULL);
-                free(tids);
-                free(args);
-                return EXIT_FAILURE;
-            }
-
-            start = end;
+            
+            pthread_create(&tids[k], NULL, worker, &args[k]);
+            start += chunk;
         }
 
-        /* Esperar a todos los hilos */
+        /* 3. Espera de hilos */
         for (int k = 0; k < n_threads; k++) {
-            int err = pthread_join(tids[k], NULL);
-            if (err != 0) {
-                fprintf(stderr, "pthread_join: %s\n", strerror(err));
-                free(tids);
-                free(args);
-                return EXIT_FAILURE;
+            pthread_join(tids[k], NULL);
+        }
+
+        /* Actualización de memoria compartida */
+        sem_wait(&shm->sem_mutex_red);
+    
+        if (found && !shm->hay_ganador) {
+            /* Ganador */
+            /* Corrompemos una solución de forma forzada para simular rechazo */
+            int valid_forced = (round % 5 != 0);
+            if (!valid_forced && found) solution += 1;
+            
+            shm->hay_ganador = 1;
+            shm->solution = solution;
+            shm->solution_winner = getpid();
+
+            if (pow_hash(shm->solution) == shm->target){
+                shm->votes_yes = 1;
+                shm->votes_no = 0;
             }
-        }
+            else{
+                shm->votes_yes = 0;
+                shm->votes_no = 1;
+            }
 
-        /* Si no se encontró solución, se informa (segun pow_hash debería existir una) */
-        if (!__atomic_load_n(&found, __ATOMIC_ACQUIRE)) {
-            fprintf(stderr, "Round %d: no solution found for target %08u\n", round, target);
-        }
+            sem_post(&shm->sem_mutex_red);
 
-        /* Validación: por defecto accepted/validated (puede forzarse rejected según enunciado) */
-        int valid = 1;
-        if (valid) {
-            printf("Solution accepted : %08u --> %08u\n", target, solution);
+            /* Emviamos la señal para votar */
+            int active_count = 0;
+            active_count = send_sig_to_miners(shm, SIGUSR2);
+        
+            /* Esperamos a que todos voten */
+            for (i = 0; i < active_count; i++){
+                sem_wait(&shm->sem_votes);
+            }
+
+            /* Evaluamos si enviar o no al comprobador */
+            sem_wait(&shm->sem_mutex_votes);
+            int total = active_count + 1;
+            int won_vote = (shm->votes_yes > total / 2);
+
+            /* --- IMPRESIÓN POR PANTALLA DEL GANADOR --- */
+            printf("Winner %d => [ ", getpid());
+            
+            /* Imprimimos las 'Y' de los votantes */
+            for (int v = 0; v < shm->votes_yes; v++) {
+                printf("Y ");
+            }
+            /* Imprimimos las 'N' de los votantes */
+            for (int v = 0; v < shm->votes_no; v++) {
+                printf("N ");
+            }
+            
+            /* Imprimimos Accepted/Rejected según el resultado de LA VOTACIÓN */
+            printf("] => %s\n", won_vote ? "Accepted" : "Rejected");
+            fflush(stdout); 
+
+            sem_post(&shm->sem_mutex_votes);
+
+            /* Si la red ha aceptado la solución, se la mandamos al Comprobador */
+            /* SIEMPRE ENVIAMOS AL COMPROBADOR (Para no romper la barrera) */
+            Message mq_msg = {0};
+            mq_msg.target = current_target;
+            mq_msg.solution = solution;
+            mq_msg.miner_pid = getpid();
+            mq_msg.is_last_miner = 0;
+            mq_send(mq, (char *)&mq_msg, sizeof(Message), 1);
+            
+    
+
         } else {
-            printf("Solution rejected : %08u --> %08u\n", target, solution);
+            sem_post(&shm->sem_mutex_red);
+
+            /* Votantes (Perdedores ), esperamos a SIGUSR2*/
+            sigsuspend(&wait_mask_usr2); 
+            
+
+            /* Abrimos el buffer y votamos */
+            sem_wait(&shm->sem_mutex_votes);
+            
+            /* Comprobar el hash de la solución propuesta */
+            long int hash_result = pow_hash((long int)shm->solution);
+            
+            if (hash_result == (long int)shm->target) {
+                shm->votes_yes++;
+            } else {
+                shm->votes_no++;
+            }
+            
+            sem_post(&shm->sem_mutex_votes);
+            sem_post(&shm->sem_votes);
         }
 
-        /* Construir mensaje y enviarlo al logger */
-        log_args msg;
-        msg.round = round;
-        msg.target = target;
-        msg.solution = solution;
-        msg.valid = valid;
+        /* Le pasamos al logger los resultados de la ronda */
+        log_args log_msg = {0};
+        sem_wait(&shm->sem_data_act);
+        sem_wait(&shm->sem_mutex_red);
+        log_msg.round = round;
+        log_msg.winner_pid = shm->solution_winner; 
+        log_msg.target = current_target;
+        log_msg.solution = shm->solution;
+        log_msg.valid = shm->validation_result;       
+        log_msg.votes_yes = shm->votes_yes; 
+        log_msg.total_votes = shm->num_active_miners;
+        log_msg.coins = shm->wallets[mi_indice];
+        sem_post(&shm->sem_mutex_red);
 
-        if (write_all(write_fd, &msg, sizeof(msg)) != 0) {
-            perror("write to logger pipe");
-            free(tids);
-            free(args);
-            return EXIT_FAILURE;
+        
+
+        if (write_all(write_fd, &log_msg, sizeof(log_msg)) != 0) {
+            break;
         }
 
-        /* La solución de esta ronda se convierte en el target de la siguiente */
-        target = solution;
+        /* --- BARRERA: CUENTA ATRÁS --- */
+        sem_wait(&shm->sem_mutex_red);
+        shm->loggers_finished--; // RESTAMOS 1
+        if (shm->loggers_finished == 0) { // El último abre la puerta
+             sem_post(&shm->sem_loggers_printed);
+        }
+        sem_post(&shm->sem_mutex_red);
+
+        sem_wait(&shm->sem_ready_next_round);
+
+        /* El minero ganador avisa a los demás SIEMPRE antes de salir */
+        sem_wait(&shm->sem_mutex_red);
+        if (shm->solution_winner == getpid()) {
+            sem_post(&shm->sem_mutex_red);
+            send_sig_to_miners(shm, SIGUSR1);
+        } else {
+            sem_post(&shm->sem_mutex_red);
+            /* Los votantes esperan (salvo que ya tengan que irse) */
+            if (!got_sig_exit) sigsuspend(&wait_mask_usr1);
+        }
+
+        /* ¡AHORA SÍ! Si se acabó nuestro tiempo, salimos */
+        if (got_sig_exit) break; 
+        
+        round++;
     }
 
     free(tids);
@@ -225,105 +332,53 @@ int miner_run(int write_fd, int read_fd, uint32_t target_ini, int rounds, int n_
     return EXIT_SUCCESS;
 }
 
-int miner_add_system(const char *filename){
-    int fd;
-    char buffer[32];
-    int len;
+/**
+ * @brief Registra al minero en la red de memoria compartida.
+ *
+ * @param shm Puntero al bloque de memoria compartida.
+ * @return El índice asignado en la red (>=0), o -1 si la red está llena.
+ */
+int miner_add_system(SharedData *shm) {
+    int index = -1;
+    if (!shm) return -1;
 
-    if (!filename){
-        return EXIT_FAILURE;
-    }
-
-    fd = open(filename, O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (fd < 0){
-        return EXIT_FAILURE;
-    }
-
-    len = sprintf(buffer, "%d\n", getpid());
-    write(fd, buffer, len);
-
-    close(fd);
-    return EXIT_SUCCESS;
-}
-
-int miner_del_system(const char *filename) {
-    if (!filename) return EXIT_FAILURE;
-
-    int fd;
-    char buffer[1024]; // Ajustar tamaño según necesidad
-    char new_content[1024] = "";
-    char my_pid_str[16];
-    ssize_t bytes_read;
-    
-    sprintf(my_pid_str, "%d", getpid()); // Obtenemos nuestro PID como string 
-
-    /* Leer el contenido actual */
-    fd = open(filename, O_RDONLY);
-    if (fd < 0) return EXIT_FAILURE;
-
-    bytes_read = read(fd, buffer, sizeof(buffer) - 1);
-    if (bytes_read < 0) {
-        close(fd);
-        return EXIT_FAILURE;
-    }
-    buffer[bytes_read] = '\0';
-    close(fd);
-
-    /* Filtrar el contenido (usando strtok para procesar línea a línea) */
-    char *line = strtok(buffer, "\n");
-    while (line != NULL) {
-        if (strcmp(line, my_pid_str) != 0) {
-            strcat(new_content, line);
-            strcat(new_content, "\n");
+    sem_wait(&shm->sem_mutex_red); // Mutex de la red
+    for (int i = 0; i < MAX_MINERS_GLOBAL; i++) {
+        if (shm->active_miners[i] == 0) {
+            shm->active_miners[i] = getpid();
+            if (shm->num_active_miners == 0 && shm->target == 0) shm->solution_winner = getpid();
+            shm->num_active_miners++;
+            index = i;
+            break;
         }
-        line = strtok(NULL, "\n");
     }
+    sem_post(&shm->sem_mutex_red);
 
-    /* Sobrescribir el archivo con el contenido filtrado */
-    fd = open(filename, O_WRONLY | O_TRUNC);
-    if (fd < 0) return EXIT_FAILURE;
-
-    if (write(fd, new_content, strlen(new_content)) < 0) {
-        close(fd);
-        return EXIT_FAILURE;
-    }
-
-    close(fd);
-    return 0;
+    return index;
 }
 
 /**
- * @brief Cuenta los mineros (líneas) en el fichero usando llamadas al sistema.
- * @param filename Nombre del fichero de PIDs.
- * @return Número de mineros o EXIT_FAILURE si hay error.
+ * @brief Elimina al minero de la red de memoria compartida y gestiona el cierre.
+ *
+ * @param shm Puntero al bloque de memoria compartida.
+ * @param mq Descriptor de la cola de mensajes hacia el Comprobador.
+ * @param mi_indice El índice asignado al minero durante el registro.
+ * @return EXIT_SUCCESS si se eliminó correctamente, EXIT_FAILURE si hay error.
  */
-int count_miners_file(char *filename) {
-    int fd;
-    ssize_t bytes_read;
-    char buffer;
-    int count = 0;
+int miner_del_system(SharedData *shm, mqd_t mq, int mi_indice) {
+    if (!shm || mi_indice < 0 || mi_indice >= MAX_MINERS_GLOBAL) return EXIT_FAILURE;
 
-    /* Abrimos en modo solo lectura usando la llamada al sistema open */
-    fd = open(filename, O_RDONLY);
-    if (fd < 0) {
-        /* Si no existe el fichero, hay 0 mineros */
-        return 0;
+    sem_wait(&shm->sem_mutex_red); // Mutex de la red
+    shm->active_miners[mi_indice] = 0;
+    shm->num_active_miners--;
+    int is_last = (shm->num_active_miners == 0);
+    sem_post(&shm->sem_mutex_red);
+
+    if (is_last) {
+        Message bye_msg = {0};
+        bye_msg.is_last_miner = 1;
+        mq_send(mq, (char *)&bye_msg, sizeof(Message), 1);
     }
 
-    /* Leemos el fichero carácter por carácter */
-    while ((bytes_read = read(fd, &buffer, 1)) > 0) {
-        if (buffer == '\n') {
-            count++;
-        }
-    }
-
-    if (bytes_read < 0) {
-        close(fd);
-        return EXIT_FAILURE; 
-    }
-
-    close(fd);
-    return count;
+    return EXIT_SUCCESS;
 }
-
-
