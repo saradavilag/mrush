@@ -31,20 +31,6 @@ extern volatile sig_atomic_t got_sig_usr2;
 extern sigset_t wait_mask_usr1;
 extern sigset_t wait_mask_usr2;
 
-/**
- * @brief Función hace sem_wait de manera segura
- *
- * @param sem SemáforoS
- */
-void safe_sem_wait(sem_t *sem) {
-    while (sem_wait(sem) == -1) {
-        if (errno == EINTR) {
-            continue; /* Si nos interrumpe SIGALRM, volvemos a esperar */
-        }
-        perror("Fallo crítico en sem_wait");
-        exit(EXIT_FAILURE);
-    }
-}
 
 /**
  * @brief Función que envía señales a los demás mineros
@@ -54,7 +40,7 @@ void safe_sem_wait(sem_t *sem) {
  */
 int send_sig_to_miners(SharedData *shm, int sig){
 
-    safe_sem_wait(&shm->sem_mutex_red);
+    sem_wait(&shm->sem_mutex_red);
 
     int active_count = 0;
     for(int i = 0; i < MAX_MINERS_GLOBAL; i++){
@@ -149,7 +135,7 @@ int miner_run(int write_fd, SharedData *shm, mqd_t mq, int mi_indice, int n_thre
     while (!got_sig_exit) {
       
         /* 1. Lectura del objetivo actual (Protegida con mutex de red) */
-        safe_sem_wait(&shm->sem_mutex_red);
+        sem_wait(&shm->sem_mutex_red);
         uint32_t current_target = shm->target;
         sem_post(&shm->sem_mutex_red);
 
@@ -180,7 +166,7 @@ int miner_run(int write_fd, SharedData *shm, mqd_t mq, int mi_indice, int n_thre
         }
 
         /* Actualización de memoria compartida */
-        safe_sem_wait(&shm->sem_mutex_red);
+        sem_wait(&shm->sem_mutex_red);
     
         if (found && !shm->hay_ganador) {
             /* Ganador */
@@ -203,7 +189,7 @@ int miner_run(int write_fd, SharedData *shm, mqd_t mq, int mi_indice, int n_thre
 
             sem_post(&shm->sem_mutex_red);
 
-            safe_sem_wait(&shm->sem_inscripcion);
+            sem_wait(&shm->sem_inscripcion);
 
             /* Emviamos la señal para votar */
             int active_count = 0;
@@ -211,11 +197,11 @@ int miner_run(int write_fd, SharedData *shm, mqd_t mq, int mi_indice, int n_thre
         
             /* Esperamos a que todos voten */
             for (i = 0; i < active_count; i++){
-                safe_sem_wait(&shm->sem_votes);
+                sem_wait(&shm->sem_votes);
             }
 
             /* Evaluamos si enviar o no al comprobador */
-            safe_sem_wait(&shm->sem_mutex_votes);
+            sem_wait(&shm->sem_mutex_votes);
             int total = active_count + 1;
             int won_vote = (shm->votes_yes > total / 2);
 
@@ -257,9 +243,12 @@ int miner_run(int write_fd, SharedData *shm, mqd_t mq, int mi_indice, int n_thre
 
             /* Votantes (Perdedores ), esperamos a SIGUSR2*/
             sigsuspend(&wait_mask_usr2); 
+            if (got_sig_exit){
+
+            }
 
             /* Abrimos el buffer y votamos */
-            safe_sem_wait(&shm->sem_mutex_votes);
+            sem_wait(&shm->sem_mutex_votes);
             
             /* Comprobar el hash de la solución propuesta */
             long int hash_result = pow_hash((long int)shm->solution);
@@ -276,8 +265,8 @@ int miner_run(int write_fd, SharedData *shm, mqd_t mq, int mi_indice, int n_thre
 
         /* Le pasamos al logger los resultados de la ronda */
         log_args log_msg = {0};
-        safe_sem_wait(&shm->sem_data_act);
-        safe_sem_wait(&shm->sem_mutex_red);
+        sem_wait(&shm->sem_data_act);
+        sem_wait(&shm->sem_mutex_red);
         log_msg.round = round;
         log_msg.winner_pid = shm->solution_winner; 
         log_msg.target = current_target;
@@ -295,7 +284,7 @@ int miner_run(int write_fd, SharedData *shm, mqd_t mq, int mi_indice, int n_thre
         }
 
         /* --- BARRERA: CUENTA ATRÁS --- */
-        safe_sem_wait(&shm->sem_mutex_red);
+        sem_wait(&shm->sem_mutex_red);
         shm->loggers_finished--; // RESTAMOS 1
 
         if (shm->loggers_finished == 0) { // El último abre la puerta
@@ -303,13 +292,21 @@ int miner_run(int write_fd, SharedData *shm, mqd_t mq, int mi_indice, int n_thre
         }
         sem_post(&shm->sem_mutex_red);
 
-        safe_sem_wait(&shm->sem_ready_next_round);
+        sem_wait(&shm->sem_ready_next_round);
    
         /* El minero ganador avisa a los demás SIEMPRE antes de salir */
-        safe_sem_wait(&shm->sem_mutex_red);
+        sem_wait(&shm->sem_mutex_red);
         if (shm->solution_winner == getpid()) {
             sem_post(&shm->sem_mutex_red);
             send_sig_to_miners(shm, SIGUSR1);
+
+            /* Comprobamos que SIGALRM no haya sonado */
+            sigset_t flush_mask;
+            sigemptyset(&flush_mask);
+            sigaddset(&flush_mask, SIGALRM);
+            
+            sigprocmask(SIG_UNBLOCK, &flush_mask, NULL);
+            sigprocmask(SIG_BLOCK, &flush_mask, NULL);
         } else {
             sem_post(&shm->sem_mutex_red);
             /* Los votantes esperan (salvo que ya tengan que irse) */
@@ -340,9 +337,9 @@ int miner_add_system(SharedData *shm) {
     if (!shm) return -1;
 
     /* Pedimos permiso a la Puerta de Inscripciones (espera no activa) */
-    safe_sem_wait(&shm->sem_inscripcion);
+    sem_wait(&shm->sem_inscripcion);
     
-    safe_sem_wait(&shm->sem_mutex_red); // Mutex de la red
+    sem_wait(&shm->sem_mutex_red); // Mutex de la red
     
     for (int i = 0; i < MAX_MINERS_GLOBAL; i++) {
         if (shm->active_miners[i] == 0) {
@@ -373,7 +370,7 @@ int miner_add_system(SharedData *shm) {
 int miner_del_system(SharedData *shm, mqd_t mq, int mi_indice) {
     if (!shm || mi_indice < 0 || mi_indice >= MAX_MINERS_GLOBAL) return EXIT_FAILURE;
 
-    safe_sem_wait(&shm->sem_mutex_red); // Mutex de la red
+    sem_wait(&shm->sem_mutex_red); // Mutex de la red
     
     /* Si ya nos hemos borrado en la barrera, esto se ignora */
     if (shm->active_miners[mi_indice] != 0) {

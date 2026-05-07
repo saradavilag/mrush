@@ -26,10 +26,6 @@
 #include "logger.h"
 #include "monitor.h" 
 
-/* Nombres de los IPC (Deben coincidir con los que cree el Monitor) */
-#define SHM_NAME "/shm_miner_rush"
-#define MQ_NAME "/mq_miner_rush"
-
 /* Variables globales exportadas para el miner.c */
 volatile sig_atomic_t got_sig_exit = 0;
 volatile sig_atomic_t got_sig_usr2 = 0;
@@ -111,6 +107,7 @@ int main(int argc, char *argv[]) {
     sigemptyset(&block_mask);
     sigaddset(&block_mask, SIGUSR1);
     sigaddset(&block_mask, SIGUSR2);
+    sigaddset(&block_mask, SIGALRM);
     sigprocmask(SIG_BLOCK, &block_mask, NULL);
     
     /* 2. Configuración estricta de señales */
@@ -130,6 +127,7 @@ int main(int argc, char *argv[]) {
     /* Preparamos las máscaras para sigsuspend */
     sigfillset(&wait_mask_usr1);
     sigdelset(&wait_mask_usr1, SIGUSR1);
+    sigdelset(&wait_mask_usr1, SIGALRM);
 
     sigfillset(&wait_mask_usr2);
     sigdelset(&wait_mask_usr2, SIGUSR2);

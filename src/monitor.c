@@ -313,6 +313,9 @@ void comprobador_run(SharedData *shm, mqd_t mq, int lag_comp) {
 void monitor_run(SharedData *shm, int lag_monitor) {
     InfoBlock block;
 
+    printf("[%d] Printing blocks ...\n", getpid());
+    fflush(stdout);
+
     while (1) {
         /* Abrimos el buffer*/
         sem_wait(&shm->sem_fill);
@@ -341,4 +344,7 @@ void monitor_run(SharedData *shm, int lag_monitor) {
         /* Lag */
         usleep(lag_monitor * 1000);
     }
+
+    printf("[%d] Finishing\n", getpid());
+    fflush(stdout);
 }
